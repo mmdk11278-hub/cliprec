@@ -3,6 +3,7 @@
 mod annotations;
 mod app;
 mod capture;
+mod icon;
 mod recorder;
 mod storage;
 mod theme;
@@ -33,6 +34,7 @@ fn main() -> eframe::Result<()> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("ClipRec — Screen Capture & Recording Studio")
+        .with_icon(std::sync::Arc::new(icon::app_icon_data()))
         .with_inner_size([1120.0, 680.0])
         .with_min_inner_size([840.0, 540.0]);
 

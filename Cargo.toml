@@ -1,7 +1,15 @@
 [package]
 name = "cliprec"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
+
+[[bin]]
+name = "cliprec"
+path = "src/main.rs"
+
+[[bin]]
+name = "ClipRec-Setup"
+path = "src/bin/cliprec-setup.rs"
 
 [dependencies]
 eframe = "0.31.1"

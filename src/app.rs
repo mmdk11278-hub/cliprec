@@ -3214,6 +3214,7 @@ impl ClipRecApp {
             egui::ViewportId::from_hash_of("rec_sidebar"),
             egui::ViewportBuilder::default()
                 .with_title("ClipRec Controls")
+                .with_icon(std::sync::Arc::new(crate::icon::app_icon_data()))
                 .with_inner_size(size)
                 .with_position(pos)
                 .with_decorations(false)

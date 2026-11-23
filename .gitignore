@@ -9,3 +9,7 @@
 *.mp4
 *.png
 *.log
+!assets/
+!assets/*.png
+!assets/*.svg
+!assets/*.ico
