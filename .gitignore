@@ -1,0 +1,11 @@
+/target
+/shots
+/.graphflow
+/nok2.txt
+/mechanics.json
+/MECHANICS.md
+/tools
+*.avi
+*.mp4
+*.png
+*.log
