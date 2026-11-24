@@ -2,8 +2,11 @@
 
 mod annotations;
 mod app;
+mod audio_loopback;
 mod capture;
+mod editor;
 mod icon;
+mod mf;
 mod recorder;
 mod storage;
 mod theme;

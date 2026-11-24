@@ -11,8 +11,14 @@ use std::time::{Duration, Instant};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use image::{imageops, Rgba, RgbaImage};
 
-use crate::capture::{capture_screen_region, encode_jpeg, even_dim};
-use crate::storage::WebcamSizePreset;
+use crate::audio_loopback::SystemAudioInput;
+use crate::capture::{
+    apply_cursor_overlay, blit_cursor, capture_cursor_sprite, capture_screen_region,
+    cursor_position, encode_jpeg, even_dim, frame_is_black, mouse_left_down, ClickRipple,
+    DxgiCapturer,
+};
+use crate::mf::Mp4Writer;
+use crate::storage::{CursorStyle, EncoderKind, WebcamSizePreset};
 
 pub type SharedFrame = Arc<Mutex<Option<Arc<RgbaImage>>>>;
 pub type LiveWebcam = Arc<Mutex<Option<(SharedFrame, WebcamSizePreset)>>>;
@@ -20,6 +26,9 @@ pub type LiveWebcam = Arc<Mutex<Option<(SharedFrame, WebcamSizePreset)>>>;
 // Cap the buffered mic audio so a long pause cannot grow memory without bound.
 const MAX_AUDIO_SAMPLES: usize = 48_000 * 2 * 60; // ~60s safety cap (drained every frame)
 const DEFAULT_SAMPLE_RATE: u32 = 48_000;
+/// All tracks are normalized to this rate/channel count before encoding.
+const AUDIO_OUT_RATE: u32 = 48_000;
+const AUDIO_OUT_CHANNELS: u16 = 2;
 
 // ============================================================================
 // Webcam
@@ -76,12 +85,22 @@ fn webcam_loop(latest: SharedFrame, error: Arc<Mutex<Option<String>>>, stop: Arc
         }
     };
 
-    let req = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(CameraFormat::new(
+    let req_mjpeg = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(CameraFormat::new(
+        Resolution::new(640, 480),
+        FrameFormat::MJPEG,
+        30,
+    )));
+    let req_yuyv = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(CameraFormat::new(
         Resolution::new(640, 480),
         FrameFormat::YUYV,
         30,
     )));
-    let mut cam = match Camera::new(CameraIndex::Index(0), req) {
+    let req_any = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+
+    let mut cam = match Camera::new(CameraIndex::Index(0), req_mjpeg)
+        .or_else(|_| Camera::new(CameraIndex::Index(0), req_yuyv))
+        .or_else(|_| Camera::new(CameraIndex::Index(0), req_any))
+    {
         Ok(c) => c,
         Err(e) => {
             set_err(format!("No webcam available: {e}"));
@@ -382,6 +401,12 @@ pub struct RecorderOutput {
     pub first_frame: Option<RgbaImage>,
     pub audio_sample_rate: u32, // 0 when no audio track
     pub audio_channels: u16,
+    /// `Some(Ok(()))` = MP4 written straight to `mp4_path` during recording.
+    pub mp4_result: Option<Result<(), String>>,
+    pub mp4_path: Option<std::path::PathBuf>,
+    pub events: Vec<String>,
+    pub total_frames: usize,
+    pub total_audio_samples: usize,
 }
 
 pub struct RecorderHandle {
@@ -389,11 +414,15 @@ pub struct RecorderHandle {
     paused: Arc<AtomicBool>,
     webcam: LiveWebcam,
     pub preview: SharedFrame,
+    pub latest_frame: SharedFrame,
     #[allow(dead_code)]
     pub frame_count: Arc<AtomicUsize>,
     audio: Option<AudioInput>,
+    system_audio: Option<SystemAudioInput>,
     pub audio_level: Arc<AtomicU32>,
+    pub sys_audio_level: Arc<AtomicU32>,
     mic_device: Option<String>,
+    events: Arc<Mutex<Vec<String>>>,
     join: Option<JoinHandle<RecorderOutput>>,
 }
 
@@ -406,6 +435,16 @@ pub struct RecorderConfig {
     pub record_system_audio: bool,
     pub mic_gain: f32,
     pub ai_mic_enhance: bool,
+    /// Try DXGI Desktop Duplication first (fixes black screens on GPU apps).
+    pub use_dxgi: bool,
+    /// Monitor index (virtual-desktop rect) used by the DXGI capturer.
+    pub monitor_index: usize,
+    /// Cursor highlight style; `None` disables the cursor overlay.
+    pub cursor_style: Option<CursorStyle>,
+    /// Native MP4 (Media Foundation) vs legacy MJPEG AVI.
+    pub encoder: EncoderKind,
+    /// Pre-computed output path when `encoder == NativeMp4` (or `None` for AVI).
+    pub mp4_path: Option<std::path::PathBuf>,
 }
 
 pub const MAX_FRAMES: usize = 108_000;
@@ -416,7 +455,9 @@ impl RecorderHandle {
         let paused = Arc::new(AtomicBool::new(false));
         let webcam: LiveWebcam = Arc::new(Mutex::new(cfg.webcam.take()));
         let preview: SharedFrame = Arc::new(Mutex::new(None));
+        let latest_frame: SharedFrame = Arc::new(Mutex::new(None));
         let frame_count = Arc::new(AtomicUsize::new(0));
+        let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
         let use_audio_track = cfg.record_mic || cfg.record_system_audio;
         let audio = if cfg.record_mic {
@@ -424,30 +465,31 @@ impl RecorderHandle {
         } else {
             None
         };
-
-        let (audio_samples, audio_level, audio_rate, audio_channels, mic_device) = match &audio {
-            Some(a) => (
-                a.samples.clone(),
-                a.level.clone(),
-                a.sample_rate,
-                a.channels,
-                Some(a.device_name.clone()),
-            ),
-            None => (
-                Arc::new(Mutex::new(Vec::new())),
-                Arc::new(AtomicU32::new(0)),
-                if use_audio_track {
-                    DEFAULT_SAMPLE_RATE
-                } else {
-                    0
-                },
-                if use_audio_track { 1 } else { 0 },
-                None,
-            ),
+        let system_audio = if cfg.record_system_audio {
+            SystemAudioInput::start()
+        } else {
+            None
         };
 
+        let (audio_samples, audio_level, mic_device) = match &audio {
+            Some(a) => (a.samples.clone(), a.level.clone(), Some(a.device_name.clone())),
+            None => (Arc::new(Mutex::new(Vec::new())), Arc::new(AtomicU32::new(0)), None),
+        };
+        let (sys_samples, sys_level) = match &system_audio {
+            Some(s) => (s.samples_arc(), s.level_arc()),
+            None => (Arc::new(Mutex::new(Vec::new())), Arc::new(AtomicU32::new(0))),
+        };
+        let mic_rate = audio.as_ref().map(|a| a.sample_rate()).unwrap_or(AUDIO_OUT_RATE);
+        let mic_channels = audio.as_ref().map(|a| a.channels()).unwrap_or(AUDIO_OUT_CHANNELS);
+        let sys_rate = system_audio.as_ref().map(|s| s.sample_rate()).unwrap_or(AUDIO_OUT_RATE);
+        let sys_channels = system_audio.as_ref().map(|s| s.channels()).unwrap_or(AUDIO_OUT_CHANNELS);
+        // Audio is normalized to 48 kHz stereo before encoding.
+        let audio_rate = if use_audio_track { AUDIO_OUT_RATE } else { 0 };
+        let audio_channels = if use_audio_track { AUDIO_OUT_CHANNELS } else { 0 };
+
         let audio_level_for_handle = audio_level.clone();
-        let (s, p, w, pv, fc, as_, al, ar, ac) = (
+        let sys_level_for_handle = sys_level.clone();
+        let (s, p, w, pv, fc, as_, al, mr, mc, ar, ac, ss, sl, sr, sc, ev) = (
             stop.clone(),
             paused.clone(),
             webcam.clone(),
@@ -455,13 +497,21 @@ impl RecorderHandle {
             frame_count.clone(),
             audio_samples,
             audio_level,
+            mic_rate,
+            mic_channels,
             audio_rate,
             audio_channels,
+            sys_samples,
+            sys_level,
+            sys_rate,
+            sys_channels,
+            events.clone(),
         );
+        let latest_frame_for_thread = latest_frame.clone();
         let join = std::thread::Builder::new()
             .name("recorder".into())
             .spawn(move || {
-                record_loop(cfg, s, p, w, pv, fc, as_, al, ar, ac)
+                record_loop(cfg, s, p, w, pv, latest_frame_for_thread, fc, as_, al, mr, mc, ar, ac, ss, sl, sr, sc, ev)
             })
             .ok();
         Self {
@@ -469,10 +519,14 @@ impl RecorderHandle {
             paused,
             webcam,
             preview,
+            latest_frame,
             frame_count,
             audio,
+            system_audio,
             audio_level: audio_level_for_handle,
+            sys_audio_level: sys_level_for_handle,
             mic_device,
+            events,
             join,
         }
     }
@@ -492,6 +546,25 @@ impl RecorderHandle {
         f32::from_bits(self.audio_level.load(Ordering::Relaxed))
     }
 
+    /// Latest peak system-audio (loopback) level (0.0..=1.0).
+    pub fn system_audio_level(&self) -> f32 {
+        f32::from_bits(self.sys_audio_level.load(Ordering::Relaxed))
+    }
+
+    /// Whether the WASAPI loopback capture thread is running.
+    pub fn system_audio_active(&self) -> bool {
+        self.system_audio.is_some()
+    }
+
+    /// Drains recorder events (capture source switches, warnings) for the UI.
+    pub fn drain_events(&self) -> Vec<String> {
+        let mut g = match self.events.lock() {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+        std::mem::take(&mut *g)
+    }
+
     /// Whether an audio track will be written to the output file.
     pub fn has_audio(&self) -> bool {
         match &self.audio {
@@ -509,6 +582,10 @@ impl RecorderHandle {
         self.preview.lock().ok().and_then(|mut g| g.take())
     }
 
+    pub fn latest_frame(&self) -> Option<Arc<RgbaImage>> {
+        self.latest_frame.lock().ok().and_then(|g| g.clone())
+    }
+
     pub fn finish(mut self) -> RecorderOutput {
         self.stop.store(true, Ordering::SeqCst);
         self.join
@@ -520,6 +597,11 @@ impl RecorderHandle {
                 first_frame: None,
                 audio_sample_rate: 0,
                 audio_channels: 0,
+                mp4_result: None,
+                mp4_path: None,
+                events: Vec::new(),
+                total_frames: 0,
+                total_audio_samples: 0,
             })
     }
 }
@@ -566,47 +648,137 @@ fn record_loop(
     paused: Arc<AtomicBool>,
     webcam: LiveWebcam,
     preview: SharedFrame,
+    latest_frame: SharedFrame,
     frame_count: Arc<AtomicUsize>,
     audio_samples: Arc<Mutex<Vec<i16>>>,
-    _audio_level: Arc<AtomicU32>,
+    audio_level: Arc<AtomicU32>,
+    mic_rate: u32,
+    mic_channels: u16,
     audio_sample_rate: u32,
     audio_channels: u16,
+    sys_samples: Arc<Mutex<Vec<i16>>>,
+    sys_level: Arc<AtomicU32>,
+    sys_rate: u32,
+    sys_channels: u16,
+    events: Arc<Mutex<Vec<String>>>,
 ) -> RecorderOutput {
-    let _ = _audio_level; // level is updated by the cpal callback; read via mic_level()
+    // Mic + system levels are updated by their callbacks; decay them here.
     enum EncoderCmd {
-        Frame(RgbaImage),
+        Frame(Arc<RgbaImage>),
         DuplicateLast,
+        Audio(Vec<i16>),
     }
 
     let target_fps = cfg.fps.clamp(1, 60);
     let interval = Duration::from_secs_f64(1.0 / target_fps as f64);
+    let mut push_event = |msg: String| {
+        if let Ok(mut g) = events.lock() {
+            if g.len() >= 8 {
+                g.remove(0);
+            }
+            g.push(msg);
+        }
+    };
+
+    // --- Native MP4 encoder (Media Foundation) or legacy JPEG pipeline ---
     let (enc_tx, enc_rx) = std::sync::mpsc::sync_channel::<EncoderCmd>(8);
+    let mp4_path_for_enc = cfg.mp4_path.clone();
+    let mp4_path_result = cfg.mp4_path.clone();
+    let out_w = even_dim(cfg.region[2]);
+    let out_h = even_dim(cfg.region[3].min(cfg.max_height.max(2)));
+    let bitrate = bitrate_for_height(cfg.max_height);
+    let fps = target_fps;
+    let use_audio_track = audio_sample_rate > 0 && audio_channels > 0;
     let enc_join = std::thread::Builder::new()
-        .name("jpeg_encoder".into())
+        .name("encoder".into())
         .spawn(move || {
             let mut encoded_frames: Vec<Vec<u8>> = Vec::new();
+            let mut frame_audio: Vec<Vec<i16>> = Vec::new();
             let mut last_hash: Option<u64> = None;
+            let mut mp4 = if let Some(path) = &mp4_path_for_enc {
+                match Mp4Writer::new(
+                    path,
+                    out_w,
+                    out_h,
+                    fps,
+                    bitrate,
+                    if use_audio_track { audio_sample_rate } else { 0 },
+                    if use_audio_track { audio_channels } else { 0 },
+                ) {
+                    Ok(w) => Some(w),
+                    Err(e) => {
+                        eprintln!("[RECORD] MP4 writer failed to start: {e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let mut mp4_error: Option<String> = None;
+            let mut mp4_active = mp4.is_some();
             while let Ok(cmd) = enc_rx.recv() {
                 match cmd {
                     EncoderCmd::DuplicateLast => {
-                        if let Some(prev) = encoded_frames.last() {
+                        if mp4_active {
+                            if let Some(w) = mp4.as_mut() {
+                                if let Err(e) = w.duplicate_last_frame() {
+                                    mp4_error.get_or_insert_with(|| format!("MP4 encoder error: {e}"));
+                                    mp4_active = false;
+                                }
+                            }
+                        } else if let Some(prev) = encoded_frames.last() {
                             encoded_frames.push(prev.clone());
+                            frame_audio.push(Vec::new());
                         }
                     }
                     EncoderCmd::Frame(frame) => {
+                        if mp4_active {
+                            if let Some(w) = mp4.as_mut() {
+                                if let Err(e) = w.write_video_frame(&frame) {
+                                    mp4_error.get_or_insert_with(|| format!("MP4 encoder error: {e}"));
+                                    mp4_active = false;
+                                } else {
+                                    continue;
+                                }
+                            }
+                        }
                         let h = sample_frame_hash(&frame);
                         if last_hash == Some(h) {
                             if let Some(prev) = encoded_frames.last() {
                                 encoded_frames.push(prev.clone());
+                                frame_audio.push(Vec::new());
                                 continue;
                             }
                         }
                         last_hash = Some(h);
                         encoded_frames.push(encode_jpeg(&frame, 58));
                     }
+                    EncoderCmd::Audio(chunk) => {
+                        if mp4_active {
+                            if let Some(w) = mp4.as_mut() {
+                                if let Err(e) = w.write_audio(&chunk) {
+                                    mp4_error.get_or_insert_with(|| format!("MP4 audio error: {e}"));
+                                    mp4_active = false;
+                                } else {
+                                    continue;
+                                }
+                            }
+                        }
+                        frame_audio.push(chunk);
+                    }
                 }
             }
-            encoded_frames
+            let mp4_result = match mp4 {
+                Some(w) => Some({
+                    if let Some(err) = mp4_error {
+                        Err(err)
+                    } else {
+                        w.finish().map_err(|e| format!("MP4 finalize failed: {e}"))
+                    }
+                }),
+                None => None,
+            };
+            (encoded_frames, frame_audio, mp4_result)
         })
         .ok();
 
@@ -614,15 +786,40 @@ fn record_loop(
     let mut frame_audio: Vec<Vec<i16>> = Vec::new();
     let mut first_frame = None;
     let mut next = Instant::now();
-    let use_audio_track = audio_sample_rate > 0 && audio_channels > 0;
     let mut active_elapsed = Duration::ZERO;
     let mut last_active_tick = Instant::now();
     let mut total_audio_samples_captured: usize = 0;
+
+    // DXGI Desktop Duplication: real GPU-desktop capture with GDI fallback.
+    let mut dxgi: Option<DxgiCapturer> = if cfg.use_dxgi {
+        match DxgiCapturer::new(cfg.monitor_index) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                push_event(format!(
+                    "DXGI capture unavailable on this machine ({e}) — using GDI."
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut dxgi_failures = 0u32;
+    let mut black_streak: u32 = 0;
+    let mut gdi_until: Option<Instant> = None;
+
+    // Cursor overlay state.
+    let mut prev_click_down = false;
+    let mut ripple: Option<ClickRipple> = None;
+    let mut cursor_sprite = None;
 
     while !stop.load(Ordering::Relaxed) {
         if paused.load(Ordering::Relaxed) {
             // Discard audio captured while paused so it is not recorded.
             drain_all(&audio_samples);
+            if cfg.record_system_audio {
+                let _ = sys_samples.lock().map(|mut g| g.clear());
+            }
             std::thread::sleep(Duration::from_millis(25));
             next = Instant::now();
             last_active_tick = Instant::now();
@@ -646,50 +843,111 @@ fn record_loop(
         }
 
         let current_cam = webcam.lock().ok().and_then(|g| g.clone());
-        let frame = grab_frame(cfg.region, cfg.max_height, current_cam.as_ref());
+        let mut frame = grab_frame_dxgi(
+            cfg.region,
+            cfg.max_height,
+            dxgi.as_mut(),
+            &mut dxgi_failures,
+            &mut black_streak,
+            &mut gdi_until,
+            &mut push_event,
+        );
+        // Always composite the webcam after capture.
+        if let Some((shared, size)) = current_cam.as_ref() {
+            if let Some(cam) = shared.lock().ok().and_then(|g| g.clone()) {
+                composite_webcam(&mut frame, &cam, *size);
+            }
+        }
+
+        // Real cursor + highlight overlay (in virtual desktop coords).
+        if let Some(style) = cfg.cursor_style {
+            if let Some(pos) = cursor_position() {
+                let down = mouse_left_down();
+                if down && !prev_click_down {
+                    ripple = Some(ClickRipple { x: pos.0, y: pos.1, phase: 0.0 });
+                }
+                prev_click_down = down;
+                if let Some(r) = ripple.as_mut() {
+                    r.phase += 1.0 / 10.0;
+                    if r.phase >= 1.0 {
+                        ripple = None;
+                    }
+                }
+                let origin = (cfg.region[0] as i32, cfg.region[1] as i32);
+                if style == CursorStyle::ColoredArrow || cursor_sprite.is_none() {
+                    cursor_sprite = capture_cursor_sprite();
+                }
+                if let Some(sprite) = cursor_sprite.as_ref() {
+                    if style != CursorStyle::ColoredArrow {
+                        blit_cursor(&mut frame, origin, sprite, pos);
+                    }
+                }
+                if style != CursorStyle::ClickRipple || ripple.is_some() {
+                    apply_cursor_overlay(&mut frame, origin, pos, style, ripple);
+                }
+            } else {
+                prev_click_down = false;
+                ripple = None;
+            }
+        }
         captured_count += 1;
         frame_count.store(captured_count, Ordering::Relaxed);
 
         // Decay the level meter so it reflects current audio, not peak-ever.
-        let cur = f32::from_bits(_audio_level.load(Ordering::Relaxed));
-        _audio_level.store((cur * 0.70).to_bits(), Ordering::Relaxed);
+        decay_level(&audio_level);
+        decay_level(&sys_level);
 
-        // Drain all microphone audio captured since the last frame for interleaving.
+        // Drain mic + system audio, mix to 48 kHz stereo, send to the encoder.
         if use_audio_track {
-            let chunk = if cfg.record_mic {
+            let mic_chunk = if cfg.record_mic {
                 drain_all(&audio_samples)
             } else {
-                // System-audio-only: silence (WASAPI loopback capture is not available
-                // in this pure-Rust build, so system audio is recorded as silence).
-                let samples_per_interval =
-                    (interval.as_secs_f64() * audio_sample_rate as f64 * audio_channels as f64)
-                        .round() as usize;
-                vec![0i16; samples_per_interval]
+                Vec::new()
             };
+            let sys_chunk = if cfg.record_system_audio {
+                drain_all(&sys_samples)
+            } else {
+                Vec::new()
+            };
+            let chunk = mix_audio(
+                &mic_chunk,
+                mic_rate,
+                mic_channels,
+                &sys_chunk,
+                sys_rate,
+                sys_channels,
+                audio_sample_rate,
+                audio_channels,
+            );
             total_audio_samples_captured += chunk.len();
-            frame_audio.push(chunk);
+            let _ = enc_tx.send(EncoderCmd::Audio(chunk));
         }
 
-        // Small preview for the UI (cheap to upload as a texture)
-        if captured_count % 2 == 1 {
-            let thumb = if frame.width() > 640 {
-                let h = (frame.height() as f32 * 640.0 / frame.width() as f32) as u32;
-                imageops::thumbnail(&frame, 640, h.max(1))
+        // Store latest frame in RAM (zero-copy Arc) for instant non-blocking mid-recording screenshots
+        let frame_arc = Arc::new(frame);
+        if let Ok(mut g) = latest_frame.lock() {
+            *g = Some(frame_arc.clone());
+        }
+        // Small preview for the UI (every 6th frame to keep UI fast)
+        if captured_count % 6 == 1 {
+            let thumb = if frame_arc.width() > 640 {
+                let h = (frame_arc.height() as f32 * 640.0 / frame_arc.width() as f32) as u32;
+                imageops::thumbnail(&*frame_arc, 640, h.max(1))
             } else {
-                frame.clone()
+                (*frame_arc).clone()
             };
             if let Ok(mut g) = preview.lock() {
                 *g = Some(Arc::new(thumb));
             }
         }
         if first_frame.is_none() {
-            first_frame = Some(frame.clone());
+            first_frame = Some((*frame_arc).clone());
         }
-        let _ = enc_tx.send(EncoderCmd::Frame(frame));
+        let _ = enc_tx.send(EncoderCmd::Frame(frame_arc));
 
         // Lock video frame count to the hardware audio clock (or active wall clock)
         // so video never drifts behind or ahead of audio.
-        let auth_elapsed_secs = if use_audio_track && cfg.record_mic && total_audio_samples_captured > 0 {
+        let auth_elapsed_secs = if use_audio_track && total_audio_samples_captured > 0 {
             total_audio_samples_captured as f64
                 / (audio_sample_rate as f64 * audio_channels.max(1) as f64)
         } else {
@@ -708,7 +966,7 @@ fn record_loop(
         }
     }
     drop(enc_tx);
-    let frames = enc_join
+    let (frames, enc_frame_audio, mp4_result) = enc_join
         .and_then(|j| j.join().ok())
         .unwrap_or_default();
     let total_audio: usize = frame_audio.iter().map(|c| c.len()).sum();
@@ -716,11 +974,149 @@ fn record_loop(
         frames.len(), frame_audio.len(), total_audio, audio_sample_rate, audio_channels);
     RecorderOutput {
         frames,
-        frame_audio,
+        frame_audio: enc_frame_audio,
         first_frame,
         audio_sample_rate,
         audio_channels,
+        mp4_result,
+        mp4_path: mp4_path_result,
+        events: std::mem::take(&mut *events.lock().unwrap_or_else(|p| p.into_inner())),
+        total_frames: captured_count,
+        total_audio_samples: total_audio_samples_captured,
     }
+}
+
+fn decay_level(level: &Arc<AtomicU32>) {
+    let cur = f32::from_bits(level.load(Ordering::Relaxed));
+    level.store((cur * 0.70).to_bits(), Ordering::Relaxed);
+}
+
+/// Mixes microphone + system audio into one stereo track at `out_rate`.
+/// Both sources are linearly resampled to (out_rate, 2ch) and summed with
+/// soft clipping at ±1.0.
+fn mix_audio(
+    mic: &[i16],
+    mic_rate: u32,
+    mic_ch: u16,
+    sys: &[i16],
+    sys_rate: u32,
+    sys_ch: u16,
+    out_rate: u32,
+    out_ch: u16,
+) -> Vec<i16> {
+    let (out_rate, out_ch) = (out_rate.max(1), out_ch.max(1));
+    let mic_f = resample_stereo_f32(mic, mic_rate, mic_ch, out_rate, out_ch);
+    let sys_f = resample_stereo_f32(sys, sys_rate, sys_ch, out_rate, out_ch);
+    let n = mic_f.len().max(sys_f.len());
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let a = mic_f.get(i).copied().unwrap_or(0.0);
+        let b = sys_f.get(i).copied().unwrap_or(0.0);
+        let s = (a + b).clamp(-1.0, 1.0);
+        out.push((s * i16::MAX as f32) as i16);
+    }
+    out
+}
+
+/// Converts interleaved i16 (rate/ch) to interleaved f32 stereo at `out_rate`.
+fn resample_stereo_f32(
+    src: &[i16],
+    src_rate: u32,
+    src_ch: u16,
+    out_rate: u32,
+    out_ch: u16,
+) -> Vec<f32> {
+    let (src_rate, src_ch) = (src_rate.max(1) as usize, src_ch.max(1) as usize);
+    let (out_rate, out_ch) = (out_rate.max(1) as usize, out_ch.max(1) as usize);
+    if src.is_empty() {
+        return Vec::new();
+    }
+    let src_frames = src.len() / src_ch;
+    let out_len = ((src_frames as f64 * out_rate as f64) / src_rate as f64).round() as usize;
+    let mut out = vec![0.0f32; out_len * out_ch];
+    for o in 0..out_len {
+        // Linear interpolation in the source frame domain.
+        let pos = (o as f64 * src_rate as f64) / out_rate as f64;
+        let i0 = (pos.floor() as usize).min(src_frames.saturating_sub(1));
+        let i1 = (i0 + 1).min(src_frames.saturating_sub(1));
+        let frac = (pos - i0 as f64) as f32;
+        for c in 0..out_ch {
+            let sc = if src_ch == 1 { 0 } else { c.min(src_ch - 1) };
+            let v0 = src[i0 * src_ch + sc] as f32 / i16::MAX as f32;
+            let v1 = src[i1 * src_ch + sc] as f32 / i16::MAX as f32;
+            out[o * out_ch + c] = v0 + (v1 - v0) * frac;
+        }
+    }
+    out
+}
+
+/// Compact, high-quality H.264 bitrate by vertical resolution.
+pub fn bitrate_for_height(max_height: u32) -> u32 {
+    match max_height {
+        0..=720 => 2_500_000,
+        721..=1080 => 4_500_000,
+        1081..=1440 => 8_000_000,
+        _ => 14_000_000,
+    }
+}
+
+/// Captures via DXGI when available/healthy, otherwise GDI; watches for black
+/// or missing DXGI frames and temporarily falls back to GDI for ~10s.
+fn grab_frame_dxgi(
+    region: [u32; 4],
+    max_height: u32,
+    mut dxgi: Option<&mut DxgiCapturer>,
+    dxgi_failures: &mut u32,
+    black_streak: &mut u32,
+    gdi_until: &mut Option<Instant>,
+    push_event: &mut dyn FnMut(String),
+) -> RgbaImage {
+    let region_i = [region[0] as i32, region[1] as i32, region[2] as i32, region[3] as i32];
+    let mut use_dxgi_now = dxgi.is_some();
+    if let Some(t) = *gdi_until {
+        if Instant::now() >= t {
+            *gdi_until = None;
+        } else {
+            use_dxgi_now = false;
+        }
+    }
+
+    if use_dxgi_now {
+        if let Some(cap) = dxgi.as_mut() {
+            if let Some(img) = cap.capture_region(region_i) {
+                *dxgi_failures = 0;
+                if frame_is_black(&img) {
+                    *black_streak += 1;
+                } else {
+                    *black_streak = 0;
+                }
+                if *black_streak >= 25 {
+                    *gdi_until = Some(Instant::now() + Duration::from_secs(10));
+                    *black_streak = 0;
+                    push_event(
+                        "DXGI returned black frames — switched to GDI capture temporarily."
+                            .to_string(),
+                    );
+                }
+                let mut frame = if img.height() > max_height {
+                    let scale = max_height as f32 / img.height() as f32;
+                    let nw = even_dim((img.width() as f32 * scale) as u32);
+                    imageops::resize(&img, nw, even_dim(max_height), imageops::FilterType::Nearest)
+                } else {
+                    img
+                };
+                return frame;
+            } else {
+                *dxgi_failures += 1;
+                if *dxgi_failures == 60 {
+                    *gdi_until = Some(Instant::now() + Duration::from_secs(10));
+                    *dxgi_failures = 0;
+                    push_event("DXGI capture stalled — switched to GDI temporarily.".to_string());
+                }
+            }
+        }
+    }
+    grab_frame(region, max_height, None)
 }
 
 // ============================================================================

@@ -79,8 +79,66 @@ pub enum CaptureMethod {
 impl CaptureMethod {
     pub fn label(self) -> &'static str {
         match self {
-            Self::DesktopDuplication => "Desktop Duplication (recommended)",
-            Self::GdiCompatible => "GDI BitBlt (compatibility)",
+            Self::DesktopDuplication => "GPU Desktop Duplication (DXGI)",
+            Self::GdiCompatible => "Fast CPU + RAM (GDI Persistent — Recommended)",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EncoderKind {
+    /// Native Windows Media Foundation MP4 (H.264 + AAC) — no external FFmpeg needed.
+    #[default]
+    NativeMp4,
+    /// Legacy Motion-JPEG AVI fallback (used when the H.264 encoder is unavailable).
+    LegacyAvi,
+}
+
+impl EncoderKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NativeMp4 => "Native MP4 (H.264 + AAC) — no FFmpeg needed",
+            Self::LegacyAvi => "Legacy AVI (MJPEG, large files)",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::NativeMp4 => Self::LegacyAvi,
+            Self::LegacyAvi => Self::NativeMp4,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CursorStyle {
+    /// Colored ring drawn around the real mouse cursor.
+    #[default]
+    Halo,
+    /// Dims everything but a bright circle around the cursor.
+    Spotlight,
+    /// Ripple ring burst on every left click.
+    ClickRipple,
+    /// Bold colored arrow replacing the real cursor.
+    ColoredArrow,
+}
+
+impl CursorStyle {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Halo => "Halo ring",
+            Self::Spotlight => "Spotlight",
+            Self::ClickRipple => "Click ripple",
+            Self::ColoredArrow => "Colored arrow",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Halo => Self::Spotlight,
+            Self::Spotlight => Self::ClickRipple,
+            Self::ClickRipple => Self::ColoredArrow,
+            Self::ColoredArrow => Self::Halo,
         }
     }
 }
@@ -173,6 +231,12 @@ pub struct AppSettings {
     pub prefer_mp4: bool,
     #[serde(default = "default_true")]
     pub compact_video: bool,
+    #[serde(default)]
+    pub encoder: EncoderKind,
+    #[serde(default)]
+    pub cursor_style: CursorStyle,
+    #[serde(default)]
+    pub admin_capture_enabled: bool,
 }
 
 impl Default for AppSettings {
@@ -184,7 +248,7 @@ impl Default for AppSettings {
         Self {
             quality: RecordingQuality::Hd1080p,
             fps: 25,
-            capture_method: CaptureMethod::DesktopDuplication,
+            capture_method: CaptureMethod::GdiCompatible,
             record_mic: true,
             mic_gain: 0.85,
             ai_mic_enhance: true,
@@ -201,6 +265,9 @@ impl Default for AppSettings {
             dictation_hotkey: "Alt+D".to_string(),
             prefer_mp4: true,
             compact_video: true,
+            encoder: EncoderKind::NativeMp4,
+            cursor_style: CursorStyle::Halo,
+            admin_capture_enabled: false,
         }
     }
 }

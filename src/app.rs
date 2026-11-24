@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use egui::{
@@ -13,16 +15,19 @@ use crate::annotations::{
 };
 use crate::capture::{
     capture_full_screen, capture_screen_region, decode_jpeg_to_rgba, encode_jpeg, even_dim,
-    exclude_window_from_capture, find_ffmpeg_exe, read_video_file, rgba_to_color_image,
-    screen_dimensions, transcode_to_mp4, write_mjpeg_avi, LoadedVideo,
+    enum_monitors, exclude_window_from_capture, find_ffmpeg_exe, read_mjpeg_avi, read_video_file,
+    rgba_to_color_image, save_png_fast, screen_dimensions, transcode_to_mp4, write_mjpeg_avi,
+    LoadedVideo,
 };
+use crate::mf::h264_encoder_available;
 use crate::recorder::{
     grab_frame, probe_default_mic_name, RecorderConfig, RecorderHandle, VideoAudioPlayer,
     WebcamFeed,
 };
 use crate::storage::{
-    format_duration, format_size, AppSettings, CaptureMethod, FloatingUiMode, MediaItem, MediaKind,
-    RecordingQuality, StorageManager, WebcamBgMode, WebcamSizePreset,
+    format_duration, format_size, AppSettings, CaptureMethod, CursorStyle, EncoderKind,
+    FloatingUiMode, MediaItem, MediaKind, RecordingQuality, StorageManager, WebcamBgMode,
+    WebcamSizePreset,
 };
 use crate::theme::{
     apply_light_theme, draw_icon, DockIcon, ANNOTATION_PALETTE, BORDER_LIGHT, CARD_BG, DANGER_RED,
@@ -35,6 +40,7 @@ use crate::theme::{
 enum ActiveView {
     CaptureStudio,
     Editor,
+    VideoEditor,
     Gallery,
     Player,
     Settings,
@@ -75,6 +81,10 @@ struct ActiveRecording {
     synced_webcam: (bool, WebcamSizePreset),
     elapsed: Duration,
     last_tick: Instant,
+    /// Output path used when the recorder writes a native MP4 during recording.
+    mp4_output: Option<(u64, String, PathBuf, PathBuf)>,
+    /// Recording was started from the one-click Lecture mode preset.
+    lecture: bool,
 }
 
 struct ActivePlayback {
@@ -92,6 +102,24 @@ struct ActivePlayback {
     texture: Option<TextureHandle>,
 }
 
+/// In-app video editor state (trim / cut / merge / export).
+struct VideoEditorState {
+    clips: Vec<crate::editor::ClipDef>,
+    width: u32,
+    height: u32,
+    fps: u32,
+    selected: usize,
+    split_sec: f32,
+    /// Current clip preview first-frame (rebuilt on demand).
+    thumb: Option<TextureHandle>,
+    thumb_frame: Option<RgbaImage>,
+    exporting: bool,
+    export_progress: Arc<Mutex<f32>>,
+    export_rx: Option<Receiver<Result<(u64, String, PathBuf), String>>>,
+    export_msg: String,
+    add_pending: Option<u64>,
+}
+
 pub struct ClipRecApp {
     storage: StorageManager,
     settings: AppSettings,
@@ -105,6 +133,8 @@ pub struct ClipRecApp {
     desktop_texture: Option<TextureHandle>,
     selection_norm: [f32; 4], // x0, y0, x1, y1 in [0..1]
     selecting_drag: bool,
+    selected_monitor: usize,
+    lecture_armed: bool,
     rec_state: RecordingState,
     active_rec: Option<ActiveRecording>,
     rec_preview_texture: Option<TextureHandle>,
@@ -145,6 +175,9 @@ pub struct ClipRecApp {
     // Video Player state
     playback: Option<ActivePlayback>,
 
+    // Video Editor state
+    video_editor: Option<VideoEditorState>,
+
     // Toast notification (5000ms auto-hide per BottomMessageDialog.qml)
     toast: Option<ToastMessage>,
 
@@ -160,6 +193,23 @@ enum ColorTarget {
     Stroke,
     Fill,
     Font,
+}
+
+/// Decodes the first frame of a video file (MP4 via Media Foundation, AVI via MJPEG reader).
+fn first_video_frame(path: &Path) -> Option<RgbaImage> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    if ext == "mp4" {
+        let mut r = crate::mf::Mp4Reader::new(path).ok()?;
+        r.next_video_frame()
+    } else {
+        let v = read_mjpeg_avi(path)?;
+        let jpeg = v.frames.first()?;
+        decode_jpeg_to_rgba(jpeg)
+    }
 }
 
 impl ClipRecApp {
@@ -199,6 +249,8 @@ impl ClipRecApp {
             desktop_texture: Some(desktop_tex),
             selection_norm: [0.12, 0.12, 0.88, 0.88],
             selecting_drag: false,
+            selected_monitor: 0,
+            lecture_armed: false,
             rec_state: RecordingState::Idle,
             active_rec: None,
             rec_preview_texture: None,
@@ -230,6 +282,7 @@ impl ClipRecApp {
             gallery_confirm_delete: false,
             thumbnails: HashMap::new(),
             playback: None,
+            video_editor: None,
             toast: None,
             screenshot_target,
             screenshot_requested: false,
@@ -247,7 +300,7 @@ impl ClipRecApp {
     }
 
     fn refresh_desktop_snapshot(&mut self, ctx: &egui::Context) {
-        let img = capture_full_screen();
+        let img = self.selection_monitor_preview();
         let tex = ctx.load_texture(
             "desktop_preview",
             rgba_to_color_image(&img),
@@ -257,18 +310,72 @@ impl ClipRecApp {
         self.desktop_texture = Some(tex);
     }
 
+    /// Returns the [x, y, w, h] virtual-desktop rect of the currently selected monitor.
+    fn selected_monitor_rect(&self) -> [i32; 4] {
+        let monitors = enum_monitors();
+        if monitors.is_empty() {
+            return [0, 0, screen_dimensions().0 as i32, screen_dimensions().1 as i32];
+        }
+        let idx = self.selected_monitor.min(monitors.len() - 1);
+        monitors[idx].rect
+    }
+
+    /// Full capture of the selected monitor (used for the Studio preview + lecture full-screen).
+    fn selection_monitor_preview(&self) -> RgbaImage {
+        let [x, y, w, h] = self.selected_monitor_rect();
+        capture_screen_region(x, y, w as u32, h as u32)
+    }
+
     fn selected_screen_region(&self) -> [u32; 4] {
-        let (sw, sh) = screen_dimensions();
+        let [mx, my, mw, mh] = self.selected_monitor_rect();
+        let (sw, sh) = (mw.max(64) as u32, mh.max(64) as u32);
         let x0 = (self.selection_norm[0].min(self.selection_norm[2]) * sw as f32).round() as u32;
         let y0 = (self.selection_norm[1].min(self.selection_norm[3]) * sh as f32).round() as u32;
         let x1 = (self.selection_norm[0].max(self.selection_norm[2]) * sw as f32).round() as u32;
         let y1 = (self.selection_norm[1].max(self.selection_norm[3]) * sh as f32).round() as u32;
         let w = even_dim(x1.saturating_sub(x0).max(64));
         let h = even_dim(y1.saturating_sub(y0).max(64));
-        [x0.min(sw.saturating_sub(w)), y0.min(sh.saturating_sub(h)), w, h]
+        [
+            mx as u32 + x0.min(sw.saturating_sub(w)),
+            my as u32 + y0.min(sh.saturating_sub(h)),
+            w,
+            h,
+        ]
     }
 
     fn take_screenshot(&mut self, ctx: &egui::Context, full_screen: bool) {
+        let mid_recording = self.rec_state != RecordingState::Idle;
+        if mid_recording {
+            let img_arc = self
+                .active_rec
+                .as_ref()
+                .and_then(|r| r.handle.latest_frame())
+                .unwrap_or_else(|| {
+                    let [rx, ry, rw, rh] = self.selected_screen_region();
+                    std::sync::Arc::new(capture_screen_region(rx as i32, ry as i32, rw, rh))
+                });
+            let (id, name, file_path, preview_path) = self.storage.next_file_paths(MediaKind::Image);
+            let item = MediaItem {
+                id,
+                name,
+                kind: MediaKind::Image,
+                file_path: file_path.to_string_lossy().to_string(),
+                preview_path: preview_path.to_string_lossy().to_string(),
+                created_unix: StorageManager::now_unix(),
+                size_bytes: 0,
+                duration_secs: 0.0,
+                width: img_arc.width(),
+                height: img_arc.height(),
+            };
+            self.items.insert(0, item);
+            self.storage.save_items(&self.items);
+            std::thread::spawn(move || {
+                let _ = save_png_fast(&img_arc, &file_path);
+            });
+            self.show_toast("Screenshot saved to Gallery!", false);
+            return;
+        }
+
         let [rx, ry, rw, rh] = if full_screen {
             let (sw, sh) = screen_dimensions();
             [0, 0, sw, sh]
@@ -278,7 +385,7 @@ impl ClipRecApp {
 
         let img = capture_screen_region(rx as i32, ry as i32, rw, rh);
         let (id, name, file_path, preview_path) = self.storage.next_file_paths(MediaKind::Image);
-        if let Err(e) = img.save(&file_path) {
+        if let Err(e) = save_png_fast(&img, &file_path) {
             self.show_toast(format!("Could not save screenshot: {e}"), true);
             return;
         }
@@ -330,29 +437,72 @@ impl ClipRecApp {
     }
 
     fn begin_recording_now(&mut self, ctx: &egui::Context) {
-        let region = self.selected_screen_region();
+        // Lecture mode: one-click preset = full screen + webcam + mic + system audio + cursor halo.
+        let lecture = self.lecture_armed;
+        self.lecture_armed = false;
+        let enable_webcam = lecture || self.settings.enable_webcam;
+        let record_mic = lecture || self.settings.record_mic;
+        let record_system_audio = lecture || self.settings.record_system_audio;
+        let region = if lecture {
+            let [mx, my, mw, mh] = self.selected_monitor_rect();
+            [mx as u32, my as u32, even_dim(mw.max(2) as u32), even_dim(mh.max(2) as u32)]
+        } else {
+            self.selected_screen_region()
+        };
         let fps = self.settings.fps.clamp(5, 30);
-        if self.settings.enable_webcam && self.webcam.is_none() {
+        if enable_webcam && self.webcam.is_none() {
             self.webcam = Some(WebcamFeed::start());
         }
-        let webcam = if self.settings.enable_webcam {
+        let webcam = if enable_webcam {
             self.webcam.as_ref().map(|w| (w.latest.clone(), self.settings.webcam_size))
         } else {
             None
         };
+
+        // Always use Fast CPU + RAM (Persistent GDI) and Native MP4 (compact, high quality).
+        let use_dxgi = false;
+        let encoder: EncoderKind = if h264_encoder_available() {
+            EncoderKind::NativeMp4
+        } else {
+            EncoderKind::LegacyAvi
+        };
+        let monitor_index = self.selected_monitor;
+        let mp4_output = if encoder == EncoderKind::NativeMp4 {
+            let (id, name, fp, prev) =
+                self.storage.next_file_paths_with_ext(MediaKind::Video, "mp4");
+            Some((id, name, fp, prev))
+        } else {
+            None
+        };
+        let mp4_path = mp4_output.clone().map(|(_, _, fp, _)| fp);
+        let cursor_style = if lecture || self.settings.mouse_highlight {
+            Some(if lecture {
+                CursorStyle::Halo
+            } else {
+                self.settings.cursor_style
+            })
+        } else {
+            None
+        };
+
         let handle = RecorderHandle::start(RecorderConfig {
             region,
             fps,
             max_height: self.settings.quality.max_height().min(1080),
             webcam,
-            record_mic: self.settings.record_mic,
-            record_system_audio: self.settings.record_system_audio,
+            record_mic,
+            record_system_audio,
             mic_gain: self.settings.mic_gain,
             ai_mic_enhance: self.settings.ai_mic_enhance,
+            use_dxgi,
+            monitor_index,
+            cursor_style,
+            encoder,
+            mp4_path,
         });
 
         // Surface audio-capture status clearly so the user knows if voice will be recorded.
-        if self.settings.record_mic {
+        if record_mic {
             if let Some(device) = handle.mic_device_name() {
                 self.mic_device = Some(device.to_string());
                 self.show_toast(
@@ -369,10 +519,9 @@ impl ClipRecApp {
         } else {
             self.mic_device = None;
         }
-        if self.settings.record_system_audio && !self.settings.record_mic {
+        if lecture && !handle.system_audio_active() {
             self.show_toast(
-                "System-audio loopback capture is unavailable in this build; \
-                 system audio will be silent. Turn Mic on to record voice.",
+                "Lecture mode: system audio could not be captured on this machine — the video will still be recorded.",
                 true,
             );
         }
@@ -381,9 +530,11 @@ impl ClipRecApp {
             region,
             fps,
             handle,
-            synced_webcam: (self.settings.enable_webcam, self.settings.webcam_size),
+            synced_webcam: (enable_webcam, self.settings.webcam_size),
             elapsed: Duration::ZERO,
             last_tick: Instant::now(),
+            mp4_output,
+            lecture,
         });
         self.rec_state = RecordingState::Recording;
         self.sidebar_capture_excluded = false;
@@ -452,7 +603,7 @@ impl ClipRecApp {
         let mut out = rec.handle.finish();
 
         // Ensure at least 1 frame was captured
-        if out.frames.is_empty() {
+        if out.frames.is_empty() && out.total_frames == 0 {
             let frame = grab_frame(rec.region, max_h, webcam_src.as_ref());
             out.frames.push(encode_jpeg(&frame, 78));
             out.first_frame = Some(frame);
@@ -466,10 +617,15 @@ impl ClipRecApp {
         let audio_sample_rate = out.audio_sample_rate;
         let audio_channels = out.audio_channels;
         let frames = out.frames;
+        let recorded_frames = out.total_frames.max(frames.len());
         let out_w = even_dim(first.width());
         let out_h = even_dim(first.height());
         let total_audio_frames: usize = if audio_sample_rate > 0 && audio_channels > 0 {
-            frame_audio.iter().map(|c| c.len()).sum::<usize>() / (audio_channels as usize)
+            if out.total_audio_samples > 0 {
+                out.total_audio_samples / (audio_channels as usize)
+            } else {
+                frame_audio.iter().map(|c| c.len()).sum::<usize>() / (audio_channels as usize)
+            }
         } else {
             0
         };
@@ -479,14 +635,10 @@ impl ClipRecApp {
             rec.elapsed.as_secs_f32().max(0.1)
         };
         let actual_fps = if exact_duration > 0.25 {
-            ((frames.len() as f32 / exact_duration).round() as u32).clamp(1, rec.fps)
+            ((recorded_frames as f32 / exact_duration).round() as u32).clamp(1, rec.fps)
         } else {
             rec.fps.max(1)
         };
-
-        let use_mp4 = self.settings.prefer_mp4 && find_ffmpeg_exe().is_some();
-        let (id, name, file_path, preview_path) =
-            self.storage.next_file_paths_with_ext(MediaKind::Video, if use_mp4 { "mp4" } else { "avi" });
 
         // Save a compact 640px-wide thumbnail instead of a full 1080p PNG
         let thumb_img = if first.width() > 640 {
@@ -495,12 +647,96 @@ impl ClipRecApp {
         } else {
             first.clone()
         };
-        let _ = thumb_img.save(&preview_path);
 
-        if use_mp4 {
-            let temp_avi = std::env::temp_dir().join(format!("cliprec_rec_{id}.avi"));
+        // --- Native MP4 final file (written during recording via Media Foundation) ---
+        let native_ok = matches!(out.mp4_result, Some(Ok(())))
+            && out
+                .mp4_path
+                .as_ref()
+                .map(|p| {
+                    std::fs::metadata(p)
+                        .map(|m| m.len() > 0)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+
+        let (item, _size_bytes) = if native_ok {
+            match rec.mp4_output.clone() {
+                Some((id, name, file_path, preview_path)) => {
+                    let _ = thumb_img.save(&preview_path);
+                    let size = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
+                    let dur = if audio_sample_rate > 0 && audio_channels > 0 && total_audio_frames > 0 {
+                        (total_audio_frames as f32 / audio_sample_rate as f32).max(0.2)
+                    } else {
+                        (recorded_frames as f32 / actual_fps as f32)
+                            .max(rec.elapsed.as_secs_f32())
+                    };
+                    (
+                        MediaItem {
+                            id,
+                            name,
+                            kind: MediaKind::Video,
+                            file_path: file_path.to_string_lossy().to_string(),
+                            preview_path: preview_path.to_string_lossy().to_string(),
+                            created_unix: StorageManager::now_unix(),
+                            size_bytes: size,
+                            duration_secs: dur,
+                            width: out_w,
+                            height: out_h,
+                        },
+                        size,
+                    )
+                }
+                None => {
+                    // MP4 written but the plan was dropped — fall back to the AVI path.
+                    if let Some(p) = &out.mp4_path {
+                        let _ = std::fs::remove_file(p);
+                    }
+                    let (id, name, file_path, preview_path) =
+                        self.storage.next_file_paths_with_ext(MediaKind::Video, "avi");
+                    if let Err(e) = write_mjpeg_avi(
+                        &file_path,
+                        out_w,
+                        out_h,
+                        actual_fps,
+                        &frames,
+                        &frame_audio,
+                        audio_sample_rate,
+                        audio_channels,
+                    ) {
+                        self.show_toast(format!("Failed to write recording: {e}"), true);
+                        return;
+                    }
+                    let _ = thumb_img.save(&preview_path);
+                    let size = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
+                    let dur = (frames.len() as f32 / actual_fps as f32)
+                        .max(rec.elapsed.as_secs_f32());
+                    (
+                        MediaItem {
+                            id,
+                            name,
+                            kind: MediaKind::Video,
+                            file_path: file_path.to_string_lossy().to_string(),
+                            preview_path: preview_path.to_string_lossy().to_string(),
+                            created_unix: StorageManager::now_unix(),
+                            size_bytes: size,
+                            duration_secs: dur,
+                            width: out_w,
+                            height: out_h,
+                        },
+                        size,
+                    )
+                }
+            }
+        } else {
+            // Partial/native MP4 failed or recorder used the legacy encoder → AVI fallback.
+            if let Some(path) = &out.mp4_path {
+                let _ = std::fs::remove_file(path);
+            }
+            let (id, name, file_path, preview_path) =
+                self.storage.next_file_paths_with_ext(MediaKind::Video, "avi");
             if let Err(e) = write_mjpeg_avi(
-                &temp_avi,
+                &file_path,
                 out_w,
                 out_h,
                 actual_fps,
@@ -512,50 +748,38 @@ impl ClipRecApp {
                 self.show_toast(format!("Failed to write recording: {e}"), true);
                 return;
             }
-            let crf = self.settings.quality.crf(self.settings.compact_video);
-            if let Err(e) = transcode_to_mp4(&temp_avi, &file_path, crf, self.settings.ai_mic_enhance) {
-                let _ = std::fs::remove_file(&temp_avi);
-                self.show_toast(format!("MP4 export failed: {e}"), true);
-                return;
-            }
-            let _ = std::fs::remove_file(&temp_avi);
-        } else if let Err(e) = write_mjpeg_avi(
-            &file_path,
-            out_w,
-            out_h,
-            actual_fps,
-            &frames,
-            &frame_audio,
-            audio_sample_rate,
-            audio_channels,
-        ) {
-            self.show_toast(format!("Failed to write recording: {e}"), true);
-            return;
-        }
-        let size_bytes = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
-        let duration_secs = (frames.len() as f32 / actual_fps as f32).max(rec.elapsed.as_secs_f32());
-
-        let item = MediaItem {
-            id,
-            name,
-            kind: MediaKind::Video,
-            file_path: file_path.to_string_lossy().to_string(),
-            preview_path: preview_path.to_string_lossy().to_string(),
-            created_unix: StorageManager::now_unix(),
-            size_bytes,
-            duration_secs,
-            width: out_w,
-            height: out_h,
+            let _ = thumb_img.save(&preview_path);
+            let size = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
+            let dur = (frames.len() as f32 / actual_fps as f32)
+                .max(rec.elapsed.as_secs_f32());
+            (
+                MediaItem {
+                    id,
+                    name,
+                    kind: MediaKind::Video,
+                    file_path: file_path.to_string_lossy().to_string(),
+                    preview_path: preview_path.to_string_lossy().to_string(),
+                    created_unix: StorageManager::now_unix(),
+                    size_bytes: size,
+                    duration_secs: dur,
+                    width: out_w,
+                    height: out_h,
+                },
+                size,
+            )
         };
+        let new_id = item.id;
+        let new_dur = item.duration_secs;
+        let frame_count = recorded_frames;
         self.items.insert(0, item);
         self.storage.save_items(&self.items);
 
-        self.open_video_in_player(ctx, id);
+        self.open_video_in_player(ctx, new_id);
         self.show_toast(
             format!(
                 "Saved {} video ({} frames) to Gallery!",
-                format_duration(duration_secs),
-                frames.len()
+                format_duration(new_dur),
+                frame_count
             ),
             false,
         );
@@ -564,7 +788,13 @@ impl ClipRecApp {
 
     fn tick_recording(&mut self, ctx: &egui::Context) {
         // Keep the webcam feed alive while the overlay is enabled, and sync changes live to recorder
-        if self.settings.enable_webcam {
+        let webcam_on = self.settings.enable_webcam
+            || self
+                .active_rec
+                .as_ref()
+                .map(|r| r.lecture)
+                .unwrap_or(false);
+        if webcam_on {
             if self.webcam.is_none() {
                 self.webcam = Some(WebcamFeed::start());
                 self.webcam_error_shown = false;
@@ -619,6 +849,14 @@ impl ClipRecApp {
                 ctx.request_repaint_after(Duration::from_millis(120));
             }
             RecordingState::Recording => {
+                // Surface recorder events (capture-source fallbacks, warnings) to the user.
+                if let Some(ref rec) = self.active_rec {
+                    for ev in rec.handle.drain_events() {
+                        if ev.contains("switched") || ev.contains("DXGI") {
+                            self.show_toast(format!("{ev}"), true);
+                        }
+                    }
+                }
                 let root_minimized = ctx.input(|i| i.viewport().minimized).unwrap_or(false);
                 if root_minimized {
                     // Drain any queued preview without spending CPU/GPU uploading to a hidden window
@@ -643,14 +881,18 @@ impl ClipRecApp {
 
                 if let Some(ref rec) = self.active_rec {
                     let mic = rec.handle.mic_level();
-                    self.sim_mic_level = if self.settings.record_mic {
+                    self.sim_mic_level = if rec.lecture || self.settings.record_mic {
                         (self.sim_mic_level * 0.75 + mic * 0.25).clamp(0.0, 1.0)
                     } else {
                         0.0
                     };
-                    // System-audio (WASAPI loopback) capture is not available in this
-                    // pure-Rust build; system audio is written as silence.
-                    self.sim_sys_level = 0.0;
+                    // WASAPI loopback system-audio level (real, not simulated anymore).
+                    let sys = rec.handle.system_audio_level();
+                    self.sim_sys_level = if (rec.lecture || self.settings.record_system_audio) {
+                        (self.sim_sys_level * 0.75 + sys * 0.25).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
                 }
             }
         }
@@ -737,6 +979,60 @@ impl ClipRecApp {
         }
     }
 
+    /// Opens the selected video in the in-app Video Editor (timeline trim/cut/merge).
+    fn open_video_editor(&mut self, ctx: &egui::Context, item_id: u64) {
+        // Editor exports via Media Foundation; if H.264 is missing we can't write MP4.
+        if !h264_encoder_available() {
+            self.show_toast(
+                "Video Editor needs the Windows H.264 encoder (Media Feature Pack) to export.",
+                true,
+            );
+            return;
+        }
+        let Some(item) = self.items.iter().find(|i| i.id == item_id).cloned() else {
+            return;
+        };
+        if item.kind != MediaKind::Video {
+            return;
+        }
+        let source = PathBuf::from(&item.file_path);
+        let mut total = item.duration_secs as f64;
+        let mut w = item.width.max(2);
+        let mut h = item.height.max(2);
+        let mut fps = 25u32;
+        if let Ok(p) = crate::editor::probe(&source) {
+            w = p.0.max(2);
+            h = p.1.max(2);
+            fps = p.2.clamp(5, 60);
+            if total <= 0.0 {
+                total = p.5;
+            }
+        }
+        let clip = crate::editor::ClipDef::new(
+            source,
+            item.name.clone(),
+            if total > 0.0 { total } else { 10.0 },
+        );
+        self.view = ActiveView::VideoEditor;
+        self.video_editor = Some(VideoEditorState {
+            clips: vec![clip],
+            width: even_dim(w),
+            height: even_dim(h),
+            fps,
+            selected: 0,
+            split_sec: 0.5,
+            thumb: None,
+            thumb_frame: None,
+            exporting: false,
+            export_progress: Arc::new(Mutex::new(0.0)),
+            export_rx: None,
+            export_msg: String::new(),
+            add_pending: None,
+        });
+        self.show_toast("Video Editor — trim / cut / merge, then Export MP4", false);
+        ctx.request_repaint();
+    }
+
     fn export_item_as_mp4(&mut self, item_id: u64) {
         let Some(idx) = self.items.iter().position(|i| i.id == item_id) else {
             return;
@@ -753,9 +1049,37 @@ impl ClipRecApp {
             return;
         }
         let mp4_path = src_path.with_extension("mp4");
-        let crf = self.settings.quality.crf(self.settings.compact_video);
         let old_size = self.items[idx].size_bytes;
-        match transcode_to_mp4(&src_path, &mp4_path, crf, self.settings.ai_mic_enhance) {
+        // Native Media Foundation conversion first (no FFmpeg), FFmpeg as fallback.
+        let native = if h264_encoder_available() {
+            let res = crate::editor::probe(&src_path).and_then(|p| {
+                let clips = vec![crate::editor::ClipDef::new(
+                    src_path.clone(),
+                    "export".to_string(),
+                    p.5,
+                )];
+                crate::editor::build_mp4(&clips, &mp4_path, p.0, p.1, p.2, |_| {})
+            });
+            match res {
+                Ok(()) => Some(()),
+                Err(_) => {
+                    let _ = std::fs::remove_file(&mp4_path);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let transcode = |app: &mut ClipRecApp| {
+            let crf = app.settings.quality.crf(app.settings.compact_video);
+            transcode_to_mp4(&src_path, &mp4_path, crf, app.settings.ai_mic_enhance)
+        };
+        let result = if native.is_some() {
+            Ok(())
+        } else {
+            transcode(self)
+        };
+        match result {
             Ok(()) => {
                 let new_size = std::fs::metadata(&mp4_path).map(|m| m.len()).unwrap_or(0);
                 let _ = std::fs::remove_file(&src_path);
@@ -800,7 +1124,28 @@ impl ClipRecApp {
                 let src_path = PathBuf::from(&self.items[idx].file_path);
                 let mp4_path = src_path.with_extension("mp4");
                 let old_size = self.items[idx].size_bytes;
-                if transcode_to_mp4(&src_path, &mp4_path, crf, self.settings.ai_mic_enhance).is_ok() {
+                // Native Media Foundation conversion first (no FFmpeg), FFmpeg as fallback.
+                let native = if h264_encoder_available() {
+                    crate::editor::probe(&src_path)
+                        .and_then(|p| {
+                            let clips = vec![crate::editor::ClipDef::new(
+                                src_path.clone(),
+                                "convert".to_string(),
+                                p.5,
+                            )];
+                            crate::editor::build_mp4(&clips, &mp4_path, p.0, p.1, p.2, |_| {})
+                        })
+                        .is_ok()
+                } else {
+                    false
+                };
+                let ok = if native {
+                    true
+                } else {
+                    let _ = std::fs::remove_file(&mp4_path);
+                    transcode_to_mp4(&src_path, &mp4_path, crf, self.settings.ai_mic_enhance).is_ok()
+                };
+                if ok {
                     let new_size = std::fs::metadata(&mp4_path).map(|m| m.len()).unwrap_or(0);
                     let _ = std::fs::remove_file(&src_path);
                     self.items[idx].file_path = mp4_path.to_string_lossy().to_string();
@@ -906,6 +1251,50 @@ impl ClipRecApp {
             }
         }
         self.show_toast("Could not copy to clipboard", true);
+    }
+
+    /// Whether the current process runs elevated (Administrator).
+    fn is_elevated(&self) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            unsafe { windows::Win32::UI::Shell::IsUserAnAdmin().as_bool() }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            false
+        }
+    }
+
+    /// Relaunches ClipRec as Administrator (triggers the UAC prompt).
+    /// Elevated processes can capture other elevated (Admin) windows.
+    fn relaunch_as_admin(&self) {
+        let exe = match std::env::current_exe() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let params = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
+        #[cfg(target_os = "windows")]
+        {
+            use windows::core::PCWSTR;
+            use windows::Win32::UI::Shell::ShellExecuteW;
+            use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+            fn wide(s: &str) -> Vec<u16> {
+                s.encode_utf16().chain(std::iter::once(0)).collect()
+            }
+            let runas = wide("runas");
+            let file = wide(&exe.to_string_lossy());
+            let args = wide(&params);
+            unsafe {
+                ShellExecuteW(
+                    None,
+                    PCWSTR(runas.as_ptr()),
+                    PCWSTR(file.as_ptr()),
+                    PCWSTR(args.as_ptr()),
+                    PCWSTR(std::ptr::null()),
+                    SW_SHOWNORMAL,
+                );
+            }
+        }
     }
 
     fn delete_items(&mut self, ids: &[u64]) {
@@ -1480,6 +1869,74 @@ impl ClipRecApp {
                     }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        // One-click Lecture mode preset.
+                        let lec_btn = egui::Button::new(
+                            RichText::new("🎓  Lecture Mode")
+                                .size(12.0)
+                                .strong()
+                                .color(Color32::WHITE),
+                        )
+                        .fill(PURPLE_ACTION);
+                        if ui
+                            .add(lec_btn)
+                            .on_hover_text(
+                                "Full screen + camera + mic + system audio + highlighted cursor, all in one click",
+                            )
+                            .clicked()
+                        {
+                            if self.rec_state == RecordingState::Idle {
+                                self.lecture_armed = true;
+                                if self.settings.countdown_enabled {
+                                    self.rec_state = RecordingState::Countdown {
+                                        started: Instant::now(),
+                                    };
+                                    self.show_toast(
+                                        "Lecture mode armed — full screen, camera, mic, system audio and cursor highlight",
+                                        false,
+                                    );
+                                } else {
+                                    self.begin_recording_now(ctx);
+                                }
+                            } else {
+                                self.show_toast("Stop the current recording first", true);
+                            }
+                        }
+
+                        let monitors = enum_monitors();
+                        if monitors.len() > 1 {
+                            let cur = self.selected_monitor.min(monitors.len() - 1);
+                            egui::ComboBox::from_id_salt("monitor_sel")
+                                .width(150.0)
+                                .selected_text(
+                                    monitors
+                                        .get(cur)
+                                        .map(|m| {
+                                            if m.primary {
+                                                format!("{}, {} (primary)", m.name, m.index + 1)
+                                            } else {
+                                                format!("{}, {}", m.name, m.index + 1)
+                                            }
+                                        })
+                                        .unwrap_or_else(|| "Screen".to_string()),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for m in &monitors {
+                                        let label = if m.primary {
+                                            format!("Monitor {} — {} (primary)", m.index + 1, m.name)
+                                        } else {
+                                            format!("Monitor {} — {}", m.index + 1, m.name)
+                                        };
+                                        if ui
+                                            .selectable_label(self.selected_monitor == m.index, label)
+                                            .clicked()
+                                        {
+                                            self.selected_monitor = m.index;
+                                            self.refresh_desktop_snapshot(ctx);
+                                        }
+                                    }
+                                });
+                        }
+
                         // Audio & Webcam quick toggles
                         let cam_btn = egui::Button::new(
                             RichText::new(if self.settings.enable_webcam {
@@ -2086,6 +2543,452 @@ impl ClipRecApp {
             });
     }
 
+    // =========================================================================
+    // VIDEO EDITOR (v1): timeline trim / cut / reorder / merge / export MP4
+    // =========================================================================
+    fn render_video_editor(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        let Some(mut ed) = self.video_editor.take() else {
+            return;
+        };
+        let mut close_editor = false;
+        let mut toast: Option<(String, bool)> = None;
+        let mut export_done: Option<Result<(u64, String, PathBuf), String>> = None;
+        let mut start_export = false;
+        let mut do_split = false;
+        let mut do_remove: Option<usize> = None;
+        let mut do_move: Option<(usize, i32)> = None;
+        let mut do_add: Option<u64> = None;
+
+        // Poll background export progress/result.
+        if ed.exporting {
+            let progress = ed.export_progress.lock().map(|g| *g).unwrap_or(0.0);
+            if let Some(rx) = ed.export_rx.take() {
+                match rx.try_recv() {
+                    Ok(r) => {
+                        ed.exporting = false;
+                        export_done = Some(r);
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        ed.export_rx = Some(rx);
+                        ed.export_msg = format!("Exporting… {:.0}%", progress * 100.0);
+                        ctx.request_repaint_after(Duration::from_millis(80));
+                    }
+                    Err(_) => {
+                        ed.exporting = false;
+                        toast = Some(("Export thread stopped unexpectedly.".into(), true));
+                    }
+                }
+            }
+        }
+
+        egui::Frame::new()
+            .fill(CARD_BG)
+            .stroke(Stroke::new(1.0, BORDER_LIGHT))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(egui::Margin::same(14))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("← Back to Gallery").clicked() {
+                        close_editor = true;
+                    }
+                    ui.label(
+                        RichText::new("Video Editor")
+                            .size(16.0)
+                            .strong()
+                            .color(PURPLE_PRIMARY),
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "{} x {} @ {} FPS — {} clip(s) • Export writes a native MP4 (no FFmpeg)",
+                            ed.width,
+                            ed.height,
+                            ed.fps,
+                            ed.clips.len()
+                        ))
+                        .size(11.5)
+                        .color(TEXT_SECONDARY),
+                    );
+                });
+
+                ui.add_space(8.0);
+
+                // Add another video from the Gallery into the timeline.
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Merge:").strong());
+                    let mut cur = ed.add_pending.unwrap_or_default();
+                    let clicked = egui::ComboBox::from_id_salt("editor_add_src")
+                        .width(260.0)
+                        .selected_text(
+                            self.items
+                                .iter()
+                                .find(|i| Some(i.id) == ed.add_pending)
+                                .map(|i| i.name.as_str())
+                                .unwrap_or("Choose video…"),
+                        )
+                        .show_ui(ui, |ui| {
+                            let mut picked = None;
+                            for item in self.items.iter().filter(|i| i.kind == MediaKind::Video) {
+                                if ui.selectable_label(cur == item.id, &item.name).clicked() {
+                                    picked = Some(item.id);
+                                }
+                            }
+                            picked
+                        })
+                        .inner;
+                    if let Some(p) = clicked {
+                        ed.add_pending = p;
+                    }
+                    if ui.button("+ Add to Timeline").clicked() {
+                        if let Some(p) = ed.add_pending {
+                            do_add = Some(p);
+                        } else {
+                            toast = Some(("Pick a video from the list first.".into(), true));
+                        }
+                    }
+                });
+
+                ui.add_space(10.0);
+                // Timeline rows
+                if ed.clips.is_empty() {
+                    ui.label(RichText::new("Timeline is empty — add clips above.").size(12.0));
+                } else {
+                    let mut drop: Option<(usize, usize)> = None;
+                    egui::ScrollArea::vertical()
+                        .max_height(240.0)
+                        .show(ui, |ui| {
+                            for i in 0..ed.clips.len() {
+                                let sel = i == ed.selected;
+                                let src_name = ed.clips[i]
+                                    .source
+                                    .file_name()
+                                    .map(|s| s.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                egui::Frame::new()
+                                    .fill(if sel {
+                                        PURPLE_SOFT
+                                    } else {
+                                        Color32::WHITE
+                                    })
+                                    .stroke(Stroke::new(
+                                        if sel { 1.5 } else { 1.0 },
+                                        if sel { PURPLE_PRIMARY } else { BORDER_LIGHT },
+                                    ))
+                                    .corner_radius(CornerRadius::same(8))
+                                    .inner_margin(egui::Margin::same(8))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            if ui.selectable_label(sel, format!("#{}", i + 1)).clicked() {
+                                                ed.selected = i;
+                                                ed.thumb = None;
+                                                ed.thumb_frame = None;
+                                            }
+                                            ui.label(RichText::new(&ed.clips[i].label).strong().size(12.0));
+                                            ui.label(
+                                                RichText::new(src_name)
+                                                    .size(10.5)
+                                                    .color(TEXT_SECONDARY),
+                                            );
+                                            ui.with_layout(
+                                                Layout::right_to_left(Align::Center),
+                                                |ui| {
+                                                    if ui.small_button("✕").on_hover_text("Remove clip").clicked()
+                                                    {
+                                                        do_remove = Some(i);
+                                                    }
+                                                    if ui.small_button("↓").clicked() {
+                                                        do_move = Some((i, 1));
+                                                    }
+                                                    if ui.small_button("↑").clicked() {
+                                                        do_move = Some((i, -1));
+                                                    }
+                                                },
+                                            );
+                                        });
+                                        ui.add_space(4.0);
+                                        let total = ed.clips[i].total_sec.max(0.1);
+                                        ui.horizontal(|ui| {
+                                            ui.label("Start");
+                                            let mut s = ed.clips[i].start_sec as f32;
+                                            if ui
+                                                .add(
+                                                    egui::Slider::new(&mut s, 0.0..=total as f32)
+                                                        .suffix(" s"),
+                                                )
+                                                .changed()
+                                            {
+                                                ed.clips[i].start_sec = s as f64;
+                                                if ed.clips[i].start_sec >= ed.clips[i].end_sec {
+                                                    ed.clips[i].end_sec =
+                                                        (ed.clips[i].start_sec + 0.1).min(total);
+                                                }
+                                            }
+                                            ui.label("End");
+                                            let mut e = ed.clips[i].end_sec as f32;
+                                            if ui
+                                                .add(
+                                                    egui::Slider::new(&mut e, 0.0..=total as f32)
+                                                        .suffix(" s"),
+                                                )
+                                                .changed()
+                                            {
+                                                ed.clips[i].end_sec = e as f64;
+                                                if ed.clips[i].end_sec <= ed.clips[i].start_sec {
+                                                    ed.clips[i].start_sec =
+                                                        (ed.clips[i].end_sec - 0.1).max(0.0);
+                                                }
+                                            }
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{:.1}s → {:.1}s  = {:.1}s",
+                                                    ed.clips[i].start_sec,
+                                                    ed.clips[i].end_sec,
+                                                    ed.clips[i].duration_sec()
+                                                ))
+                                                .size(11.0)
+                                                .color(TEXT_SECONDARY),
+                                            );
+                                        });
+                                    });
+                            }
+                        });
+
+                    // Split the selected clip.
+                    let idx = ed.selected.min(ed.clips.len().saturating_sub(1));
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let c = &ed.clips[idx];
+                        let total = c.total_sec.max(0.1);
+                        ui.label(format!(
+                            "Split #{} at:",
+                            idx + 1
+                        ));
+                        ui.add(
+                            egui::Slider::new(&mut ed.split_sec, 0.0..=total as f32).suffix(" s"),
+                        );
+                        if ui
+                            .button("Cut Here")
+                            .on_hover_text("Splits this clip into two — then remove the part you do not want")
+                            .clicked()
+                        {
+                            do_split = true;
+                        }
+                    });
+                }
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                // Preview of the selected clip's first frame.
+                if !ed.clips.is_empty() {
+                    let idx = ed.selected.min(ed.clips.len() - 1);
+                    if ed.thumb_frame.is_none() && ed.thumb.is_none() {
+                        if let Some(c) = ed.clips.get(idx) {
+                            if let Some(frame) = first_video_frame(&c.source) {
+                                let tex = ctx.load_texture(
+                                    "video_editor_thumb",
+                                    rgba_to_color_image(&frame),
+                                    TextureOptions::LINEAR,
+                                );
+                                ed.thumb = Some(tex);
+                                ed.thumb_frame = Some(frame);
+                            }
+                        }
+                    }
+                    if let Some(ref tex) = ed.thumb {
+                        let [tw, th] = tex.size();
+                        let max_w = 240.0;
+                        let scale = (max_w / tw.max(1) as f32).min(1.0);
+                        let size = Vec2::new(tw as f32 * scale, th as f32 * scale);
+                        let (r, _) = ui.allocate_exact_size(size, Sense::hover());
+                        ui.painter().image(
+                            tex.id(),
+                            r,
+                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                    }
+                }
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let total_out: f64 = ed
+                        .clips
+                        .iter()
+                        .map(|c| c.duration_sec())
+                        .sum();
+                    if ed.exporting {
+                        ui.vertical(|ui| {
+                            ui.add(
+                                egui::ProgressBar::new(
+                                    ed.export_progress.lock().map(|g| *g).unwrap_or(0.0),
+                                )
+                                    .desired_width(320.0)
+                                    .text(&ed.export_msg),
+                            );
+                        });
+                    } else {
+                        let btn = egui::Button::new(
+                            RichText::new(format!(
+                                "Export MP4  ({:.1}s total)",
+                                total_out
+                            ))
+                            .strong()
+                            .color(Color32::WHITE),
+                        )
+                        .fill(PURPLE_ACTION);
+                        if ui.add(btn).clicked() {
+                            start_export = true;
+                        }
+                    }
+                });
+            });
+
+        // ---- Apply editor actions ------------------------------------------
+        if do_split {
+            let idx = ed.selected.min(ed.clips.len().saturating_sub(1));
+            let c = &ed.clips[idx];
+            let total = c.total_sec;
+            let pos = (ed.split_sec as f64)
+                .clamp((c.start_sec + 0.05).min(c.end_sec - 0.05), (c.end_sec - 0.05).max(c.start_sec + 0.05));
+            if c.duration_sec() > 0.3 {
+                let mut a = c.clone();
+                a.end_sec = pos;
+                let mut b = c.clone();
+                b.start_sec = pos;
+                ed.clips.splice(idx..=idx, [a, b]);
+                ed.selected = idx;
+            } else {
+                toast = Some(("Clip too short to split.".into(), true));
+            }
+            ed.thumb = None;
+            ed.thumb_frame = None;
+        }
+        if let Some(i) = do_remove {
+            if ed.clips.len() > 1 {
+                ed.clips.remove(i);
+                ed.selected = ed.selected.min(ed.clips.len() - 1);
+                ed.thumb = None;
+                ed.thumb_frame = None;
+            } else {
+                toast = Some(("A timeline needs at least one clip.".into(), true));
+            }
+        }
+        if let Some((i, d)) = do_move {
+            let j = (i as i32 + d).clamp(0, ed.clips.len() as i32 - 1) as usize;
+            ed.clips.swap(i, j);
+            ed.selected = j;
+        }
+        if let Some(id) = do_add {
+            if let Some(item) = self.items.iter().find(|it| it.id == id).cloned() {
+                let src = PathBuf::from(&item.file_path);
+                let mut total = item.duration_secs as f64;
+                let mut fps = ed.fps;
+                if let Ok(p) = crate::editor::probe(&src) {
+                    if total <= 0.0 {
+                        total = p.5;
+                    }
+                    fps = p.2.clamp(5, 60);
+                }
+                ed.clips.push(crate::editor::ClipDef::new(
+                    src,
+                    item.name.clone(),
+                    if total > 0.0 { total } else { 10.0 },
+                ));
+                ed.fps = fps;
+                ed.selected = ed.clips.len() - 1;
+                ed.add_pending = None;
+                ed.thumb = None;
+                ed.thumb_frame = None;
+            }
+        }
+        if start_export {
+            let clips: Vec<crate::editor::ClipDef> = ed
+                .clips
+                .iter()
+                .filter(|c| c.duration_sec() > 0.05)
+                .cloned()
+                .collect();
+            if clips.is_empty() {
+                toast = Some(("No valid clips to export — set the start/end ranges.".into(), true));
+            } else {
+                let (id, name, out_path, _prev) =
+                    self.storage.next_file_paths_with_ext(MediaKind::Video, "mp4");
+                let w = ed.width.max(2);
+                let h = ed.height.max(2);
+                let fps = ed.fps.clamp(5, 60);
+                let progress = ed.export_progress.clone();
+                *ed.export_progress.lock().unwrap() = 0.0;
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::Builder::new()
+                    .name("editor_export".into())
+                    .spawn(move || {
+                        let res = crate::editor::build_mp4(
+                            &clips,
+                            &out_path,
+                            w,
+                            h,
+                            fps,
+                            move |p| {
+                                if let Ok(mut g) = progress.lock() {
+                                    *g = p;
+                                }
+                            },
+                        );
+                        let _ = tx.send(res.map(|_| (id, name, out_path)));
+                    })
+                    .ok();
+                ed.export_rx = Some(rx);
+                ed.exporting = true;
+                ed.export_msg = "Starting export…".into();
+            }
+        }
+
+        self.video_editor = Some(ed);
+
+        if close_editor {
+            self.video_editor = None;
+            self.view = ActiveView::Gallery;
+        }
+        if let Some((msg, is_err)) = toast {
+            self.show_toast(msg, is_err);
+        }
+        if let Some(res) = export_done {
+            match res {
+                Ok((id, name, path)) => {
+                    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    let dur: f32 = self
+                        .video_editor
+                        .as_ref()
+                        .map(|e| e.clips.iter().map(|c| c.duration_sec() as f32).sum())
+                        .unwrap_or(0.0);
+                    let item = MediaItem {
+                        id,
+                        name,
+                        kind: MediaKind::Video,
+                        file_path: path.to_string_lossy().to_string(),
+                        preview_path: path.to_string_lossy().to_string(),
+                        created_unix: StorageManager::now_unix(),
+                        size_bytes: size,
+                        duration_secs: dur.max(0.1),
+                        width: 0,
+                        height: 0,
+                    };
+                    self.items.insert(0, item);
+                    self.storage.save_items(&self.items);
+                    self.open_video_in_player(ctx, id);
+                    self.show_toast(
+                        format!("Video exported — MP4 saved ({}).", format_size(size)),
+                        false,
+                    );
+                }
+                Err(e) => {
+                    self.show_toast(format!("Export failed: {e}"), true);
+                }
+            }
+        }
+    }
+
     fn color_swatch_btn(&self, ui: &mut egui::Ui, label: &str, col: Color32) -> bool {
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(66.0, 28.0), Sense::click());
         ui.painter().rect_filled(
@@ -2334,6 +3237,7 @@ impl ClipRecApp {
         let mut action_delete: Option<u64> = None;
         let mut action_copy_path: Option<String> = None;
         let mut action_export_mp4: Option<u64> = None;
+        let mut action_edit_video: Option<u64> = None;
         let mut action_commit_rename: Option<(u64, String)> = None;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -2447,6 +3351,14 @@ impl ClipRecApp {
                                             {
                                                 action_export_mp4 = Some(item.id);
                                             }
+                                            if item.kind == MediaKind::Video
+                                                && ui
+                                                    .small_button("Edit")
+                                                    .on_hover_text("Trim / cut / merge in Video Editor")
+                                                    .clicked()
+                                            {
+                                                action_edit_video = Some(item.id);
+                                            }
                                             if ui.small_button("Path").on_hover_text("Copy file path").clicked() {
                                                 action_copy_path = Some(item.file_path.clone());
                                             }
@@ -2482,6 +3394,9 @@ impl ClipRecApp {
         }
         if let Some(id) = action_export_mp4 {
             self.export_item_as_mp4(id);
+        }
+        if let Some(id) = action_edit_video {
+            self.open_video_editor(ctx, id);
         }
         if let Some((id, new_name)) = action_commit_rename {
             let trimmed = new_name.trim().to_string();
@@ -2597,6 +3512,7 @@ impl ClipRecApp {
         let next_vid = current_vid_pos.and_then(|idx| video_ids.get(idx + 1).copied());
         let mut switch_video: Option<u64> = None;
         let mut export_mp4_id: Option<u64> = None;
+        let mut edit_video_id: Option<u64> = None;
 
         let item_meta = self.items.iter().find(|i| i.id == pb.item_id).cloned();
         let avail = ui.available_size();
@@ -2771,6 +3687,16 @@ impl ClipRecApp {
                             {
                                 export_mp4_id = Some(meta.id);
                             }
+                            if ui
+                                .add(
+                                    egui::Button::new(RichText::new("Open Video Editor").color(Color32::WHITE))
+                                        .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 24)),
+                                )
+                                .on_hover_text("Trim / cut / merge this video and export MP4")
+                                .clicked()
+                            {
+                                edit_video_id = Some(meta.id);
+                            }
                         }
                         if pb.audio_player.is_some() {
                             if ui
@@ -2819,6 +3745,9 @@ impl ClipRecApp {
         }
         if let Some(id) = export_mp4_id {
             self.export_item_as_mp4(id);
+        }
+        if let Some(id) = edit_video_id {
+            self.open_video_editor(ctx, id);
         }
     }
 
@@ -2911,8 +3840,27 @@ impl ClipRecApp {
                             });
 
                         ui.add_space(12.0);
+                        ui.label(RichText::new("Video Encoder").strong());
+                        egui::ComboBox::from_id_salt("settings_encoder")
+                            .width(320.0)
+                            .selected_text(self.settings.encoder.label())
+                            .show_ui(ui, |ui| {
+                                for e in [EncoderKind::NativeMp4, EncoderKind::LegacyAvi] {
+                                    if ui.selectable_value(&mut self.settings.encoder, e, e.label()).changed() {
+                                        changed = true;
+                                    }
+                                }
+                            });
+                        ui.label(
+                            RichText::new(
+                                "Native MP4 records straight to H.264+AAC using Windows Media Foundation — \
+                                 small files and no FFmpeg needed. AVI is the compatibility fallback.",
+                            )
+                            .size(11.5)
+                            .color(TEXT_SECONDARY),
+                        );
                         if ui
-                            .checkbox(&mut self.settings.prefer_mp4, "Save recordings as MP4 (H.264 + AAC)")
+                            .checkbox(&mut self.settings.prefer_mp4, "Prefer MP4 output (kept for older settings)")
                             .changed()
                         {
                             changed = true;
@@ -2937,6 +3885,29 @@ impl ClipRecApp {
                             .changed()
                         {
                             changed = true;
+                        }
+                        if self.settings.mouse_highlight {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Cursor Style").strong());
+                                egui::ComboBox::from_id_salt("settings_cursor_style")
+                                    .width(170.0)
+                                    .selected_text(self.settings.cursor_style.label())
+                                    .show_ui(ui, |ui| {
+                                        for c in [
+                                            CursorStyle::Halo,
+                                            CursorStyle::Spotlight,
+                                            CursorStyle::ClickRipple,
+                                            CursorStyle::ColoredArrow,
+                                        ] {
+                                            if ui
+                                                .selectable_value(&mut self.settings.cursor_style, c, c.label())
+                                                .changed()
+                                            {
+                                                changed = true;
+                                            }
+                                        }
+                                    });
+                            });
                         }
                         if ui
                             .checkbox(&mut self.settings.auto_open_editor, "Open Annotation Editor after taking a screenshot")
@@ -3086,6 +4057,63 @@ impl ClipRecApp {
                         if ui.button("Open Recordings Folder").clicked() {
                             StorageManager::open_in_explorer(&self.storage.records_dir);
                         }
+
+                        ui.add_space(14.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new("Elevated / Admin Windows")
+                                .size(15.5)
+                                .strong()
+                                .color(PURPLE_PRIMARY),
+                        );
+                        ui.add_space(6.0);
+                        if ui
+                            .checkbox(
+                                &mut self.settings.admin_capture_enabled,
+                                "Enable Admin capture (restart ClipRec elevated)",
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        ui.label(
+                            RichText::new(
+                                "Restarting as Administrator lets ClipRec record windows that run elevated. \
+                                 Note: DRM content (Netflix app) and the UAC secure desktop still cannot be \
+                                 captured by any tool.",
+                            )
+                            .size(11.0)
+                            .color(TEXT_SECONDARY),
+                        );
+                        ui.add_space(4.0);
+                        if self.is_elevated() {
+                            ui.label(
+                                RichText::new("Status: running as Administrator")
+                                    .size(12.0)
+                                    .color(LEVEL_GREEN),
+                            );
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new("Status: normal user")
+                                        .size(12.0)
+                                        .color(TEXT_SECONDARY),
+                                );
+                                if ui
+                                    .button("Restart as Administrator now (UAC)")
+                                    .on_hover_text("A UAC consent dialog will appear once")
+                                    .clicked()
+                                {
+                                    self.storage.save_settings(&self.settings);
+                                    self.relaunch_as_admin();
+                                    self.show_toast(
+                                        "Restarting as Administrator — confirm the UAC prompt…",
+                                        false,
+                                    );
+                                }
+                            });
+                        }
                     });
             });
         });
@@ -3147,6 +4175,7 @@ impl eframe::App for ClipRecApp {
             .show(ctx, |ui| match self.view {
                 ActiveView::CaptureStudio => self.render_capture_studio(ctx, ui),
                 ActiveView::Editor => self.render_editor(ctx, ui),
+            ActiveView::VideoEditor => self.render_video_editor(ctx, ui),
                 ActiveView::Gallery => self.render_gallery(ctx, ui),
                 ActiveView::Player => self.render_player(ctx, ui),
                 ActiveView::Settings => self.render_settings(ui),

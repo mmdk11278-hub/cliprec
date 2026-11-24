@@ -199,14 +199,16 @@ fn build_coff_rsrc_from_ico(ico: &[u8]) -> Vec<u8> {
     // Lang dirs: (count + 1) * (16 + 8 = 24 bytes)
     // Data entries: (count + 1) * 16 bytes
     // Raw data blobs (4-byte aligned)
-    let root_size = 16 + 2 * 8;
+    let root_size = 16 + 3 * 8;
     let type3_off = root_size;
     let type3_size = 16 + count * 8;
     let type14_off = type3_off + type3_size;
     let type14_size = 16 + 8;
-    let lang_base = type14_off + type14_size;
-    let data_entry_base = lang_base + (count + 1) * 24;
-    let mut blob_off = data_entry_base + (count + 1) * 16;
+    let type24_off = type14_off + type14_size;
+    let type24_size = 16 + 8;
+    let lang_base = type24_off + type24_size;
+    let data_entry_base = lang_base + (count + 2) * 24;
+    let mut blob_off = data_entry_base + (count + 2) * 16;
 
     let mut rsrc = vec![0u8; blob_off];
     let write_dir = |buf: &mut [u8], off: usize, n_id: u16| {
@@ -218,10 +220,11 @@ fn build_coff_rsrc_from_ico(ico: &[u8]) -> Vec<u8> {
         buf[off + 4..off + 8].copy_from_slice(&val.to_le_bytes());
     };
 
-    // Root
-    write_dir(&mut rsrc, 0, 2);
+    // Root (3 resource types: RT_ICON=3, RT_GROUP_ICON=14, RT_MANIFEST=24)
+    write_dir(&mut rsrc, 0, 3);
     write_entry(&mut rsrc, 16, 3, type3_off as u32, true);
     write_entry(&mut rsrc, 24, 14, type14_off as u32, true);
+    write_entry(&mut rsrc, 32, 24, type24_off as u32, true);
 
     // Type 3 (RT_ICON)
     write_dir(&mut rsrc, type3_off, count as u16);
@@ -241,6 +244,25 @@ fn build_coff_rsrc_from_ico(ico: &[u8]) -> Vec<u8> {
     write_dir(&mut rsrc, grp_lang_off, 1);
     write_entry(&mut rsrc, grp_lang_off + 16, 0x0409, grp_de_off as u32, false);
 
+    // Type 24 (RT_MANIFEST, ID 1 — requireAdministrator)
+    let man_lang_off = lang_base + (count + 1) * 24;
+    let man_de_off = data_entry_base + (count + 1) * 16;
+    write_dir(&mut rsrc, type24_off, 1);
+    write_entry(&mut rsrc, type24_off + 16, 1, man_lang_off as u32, true);
+    write_dir(&mut rsrc, man_lang_off, 1);
+    write_entry(&mut rsrc, man_lang_off + 16, 0x0409, man_de_off as u32, false);
+
+    let manifest_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+</assembly>"#;
+
     // Data entries + blobs + COFF relocations
     let mut relocs: Vec<(u32, u32, u16)> = Vec::new();
     for (i, (_, _, _, _, data)) in icon_frames.iter().enumerate() {
@@ -258,6 +280,15 @@ fn build_coff_rsrc_from_ico(ico: &[u8]) -> Vec<u8> {
     rsrc[grp_de_off + 4..grp_de_off + 8].copy_from_slice(&(grp.len() as u32).to_le_bytes());
     relocs.push((grp_de_off as u32, 0, 0x0003));
     rsrc.extend_from_slice(&grp);
+    while rsrc.len() % 4 != 0 {
+        rsrc.push(0);
+    }
+    blob_off = rsrc.len();
+
+    rsrc[man_de_off..man_de_off + 4].copy_from_slice(&(blob_off as u32).to_le_bytes());
+    rsrc[man_de_off + 4..man_de_off + 8].copy_from_slice(&(manifest_xml.len() as u32).to_le_bytes());
+    relocs.push((man_de_off as u32, 0, 0x0003));
+    rsrc.extend_from_slice(manifest_xml);
     while rsrc.len() % 4 != 0 {
         rsrc.push(0);
     }

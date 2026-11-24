@@ -4,6 +4,13 @@ use std::path::Path;
 
 use image::{ImageFormat, RgbaImage};
 
+use crate::storage::CursorStyle;
+
+#[cfg(target_os = "windows")]
+use windows::Win32::Graphics::Direct3D11::D3D11_MAPPED_SUBRESOURCE;
+#[cfg(target_os = "windows")]
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+
 /// Real screen dimensions in physical pixels
 pub fn screen_dimensions() -> (u32, u32) {
     #[cfg(target_os = "windows")]
@@ -161,32 +168,79 @@ extern "system" {
 }
 
 #[cfg(target_os = "windows")]
-fn capture_gdi_windows(x: i32, y: i32, w: u32, h: u32) -> Option<RgbaImage> {
-    unsafe {
-        let hdc_screen = GetDC(std::ptr::null_mut());
-        if hdc_screen.is_null() {
-            return None;
-        }
-        let hdc_mem = CreateCompatibleDC(hdc_screen);
-        if hdc_mem.is_null() {
-            ReleaseDC(std::ptr::null_mut(), hdc_screen);
-            return None;
-        }
-        let hbm = CreateCompatibleBitmap(hdc_screen, w as i32, h as i32);
-        if hbm.is_null() {
-            DeleteDC(hdc_mem);
-            ReleaseDC(std::ptr::null_mut(), hdc_screen);
-            return None;
-        }
-        let old = SelectObject(hdc_mem, hbm);
-        let ok = BitBlt(hdc_mem, 0, 0, w as i32, h as i32, hdc_screen, x, y, SRCCOPY | CAPTUREBLT);
+struct ThreadGdiCache {
+    hdc_screen: *mut core::ffi::c_void,
+    hdc_mem: *mut core::ffi::c_void,
+    hbm: *mut core::ffi::c_void,
+    old: *mut core::ffi::c_void,
+    w: u32,
+    h: u32,
+    buf: Vec<u8>,
+}
 
-        let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
+#[cfg(target_os = "windows")]
+impl ThreadGdiCache {
+    fn new() -> Self {
+        Self {
+            hdc_screen: std::ptr::null_mut(),
+            hdc_mem: std::ptr::null_mut(),
+            hbm: std::ptr::null_mut(),
+            old: std::ptr::null_mut(),
+            w: 0,
+            h: 0,
+            buf: Vec::new(),
+        }
+    }
+
+    unsafe fn capture(&mut self, x: i32, y: i32, w: u32, h: u32) -> Option<RgbaImage> {
+        if self.hdc_screen.is_null() {
+            self.hdc_screen = GetDC(std::ptr::null_mut());
+            if self.hdc_screen.is_null() {
+                return None;
+            }
+        }
+        if self.hdc_mem.is_null() {
+            self.hdc_mem = CreateCompatibleDC(self.hdc_screen);
+            if self.hdc_mem.is_null() {
+                return None;
+            }
+        }
+        if self.hbm.is_null() || self.w != w || self.h != h {
+            if !self.hbm.is_null() {
+                SelectObject(self.hdc_mem, self.old);
+                DeleteObject(self.hbm);
+                self.hbm = std::ptr::null_mut();
+            }
+            self.hbm = CreateCompatibleBitmap(self.hdc_screen, w as i32, h as i32);
+            if self.hbm.is_null() {
+                return None;
+            }
+            self.old = SelectObject(self.hdc_mem, self.hbm);
+            self.w = w;
+            self.h = h;
+            self.buf.resize((w as usize) * (h as usize) * 4, 0);
+        }
+
+        let ok = BitBlt(
+            self.hdc_mem,
+            0,
+            0,
+            w as i32,
+            h as i32,
+            self.hdc_screen,
+            x,
+            y,
+            SRCCOPY | CAPTUREBLT,
+        );
+        if ok == 0 {
+            return None;
+        }
+
         let mut bmi = BitmapInfo {
             bmi_header: BitmapInfoHeader {
                 bi_size: std::mem::size_of::<BitmapInfoHeader>() as u32,
                 bi_width: w as i32,
-                bi_height: -(h as i32), // top-down DIB
+                bi_height: -(h as i32),
                 bi_planes: 1,
                 bi_bit_count: 32,
                 bi_compression: BI_RGB,
@@ -199,29 +253,68 @@ fn capture_gdi_windows(x: i32, y: i32, w: u32, h: u32) -> Option<RgbaImage> {
             bmi_colors: [0],
         };
 
-        let lines = if ok != 0 {
-            GetDIBits(hdc_mem, hbm, 0, h, buf.as_mut_ptr(), &mut bmi, DIB_RGB_COLORS)
-        } else {
-            0
-        };
-
-        SelectObject(hdc_mem, old);
-        DeleteObject(hbm);
-        DeleteDC(hdc_mem);
-        ReleaseDC(std::ptr::null_mut(), hdc_screen);
-
+        let lines = GetDIBits(
+            self.hdc_mem,
+            self.hbm,
+            0,
+            h,
+            self.buf.as_mut_ptr(),
+            &mut bmi,
+            DIB_RGB_COLORS,
+        );
         if lines == 0 {
             return None;
         }
 
-        // Convert BGRA -> RGBA with full alpha
-        for px in buf.chunks_exact_mut(4) {
+        let mut out = self.buf.clone();
+        for px in out.chunks_exact_mut(4) {
             px.swap(0, 2);
             px[3] = 255;
         }
-
-        RgbaImage::from_raw(w, h, buf)
+        RgbaImage::from_raw(w, h, out)
     }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for ThreadGdiCache {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.hbm.is_null() {
+                SelectObject(self.hdc_mem, self.old);
+                DeleteObject(self.hbm);
+            }
+            if !self.hdc_mem.is_null() {
+                DeleteDC(self.hdc_mem);
+            }
+            if !self.hdc_screen.is_null() {
+                ReleaseDC(std::ptr::null_mut(), self.hdc_screen);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn capture_gdi_windows(x: i32, y: i32, w: u32, h: u32) -> Option<RgbaImage> {
+    std::thread_local! {
+        static CACHE: std::cell::RefCell<ThreadGdiCache> = std::cell::RefCell::new(ThreadGdiCache::new());
+    }
+    CACHE.with(|c| unsafe { c.borrow_mut().capture(x, y, w, h) })
+}
+
+/// Fast PNG writer using `CompressionType::Fast` + `FilterType::NoFilter` (~8x faster than default).
+pub fn save_png_fast(img: &RgbaImage, path: &Path) -> std::io::Result<()> {
+    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+    use image::ImageEncoder;
+    let file = File::create(path)?;
+    let wtr = BufWriter::new(file);
+    let enc = PngEncoder::new_with_quality(wtr, CompressionType::Fast, FilterType::NoFilter);
+    enc.write_image(
+        img.as_raw(),
+        img.width(),
+        img.height(),
+        image::ExtendedColorType::Rgba8,
+    )
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
 }
 
 /// Pure-Rust Motion-JPEG AVI writer with an optional interleaved PCM audio stream.
@@ -561,10 +654,46 @@ pub struct LoadedVideo {
     pub audio_channels: u16,
 }
 
+/// Decodes an `.mp4` via Windows Media Foundation (`SourceReader`), no FFmpeg.
+fn read_mp4_via_mf(path: &Path) -> Option<LoadedVideo> {
+    use crate::mf::Mp4Reader;
+    let mut r = Mp4Reader::new(path).ok()?;
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+    while frames.len() < 120_000 {
+        match r.next_video_frame() {
+            Some(frame) => frames.push(encode_jpeg_fast(&frame, 62)),
+            None => break,
+        }
+    }
+    if frames.is_empty() {
+        return None;
+    }
+    Some(LoadedVideo {
+        width: r.width.max(2),
+        height: r.height.max(2),
+        fps: r.fps.max(1),
+        frames,
+        audio_samples: r.audio_samples,
+        audio_sample_rate: r.audio_rate,
+        audio_channels: r.audio_channels,
+    })
+}
+
 /// Loads either an `.avi` or `.mp4` (via FFmpeg decode to temp MJPEG AVI) for the native Video Player.
 pub fn read_video_file(path: &Path) -> Option<LoadedVideo> {
     if let Some(v) = read_mjpeg_avi(path) {
         return Some(v);
+    }
+    // Native MP4 via Windows Media Foundation — no external FFmpeg needed.
+    if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("mp4"))
+        .unwrap_or(false)
+    {
+        if let Some(v) = read_mp4_via_mf(path) {
+            return Some(v);
+        }
     }
     let ffmpeg = find_ffmpeg_exe()?;
     let temp_avi = std::env::temp_dir().join(format!(
@@ -782,3 +911,976 @@ mod tests {
         let _ = std::fs::remove_file(&avi_path);
     }
 }
+// ============================================================================
+// v0.4.0 — DXGI Desktop Duplication capture, multi-monitor, real cursor,
+// cursor highlight styles and black-frame detection (no external FFmpeg).
+// ============================================================================
+
+/// Info about one attached monitor (virtual desktop coordinates).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MonitorInfo {
+    pub index: usize,
+    pub primary: bool,
+    /// [x, y, w, h] in virtual-desktop pixels.
+    pub rect: [i32; 4],
+    pub name: String,
+}
+
+/// Bounding box of the whole virtual desktop: [x, y, w, h].
+pub fn virtual_screen_rect() -> [i32; 4] {
+    #[cfg(target_os = "windows")]
+    {
+        const SM_XVIRTUALSCREEN: i32 = 76;
+        const SM_YVIRTUALSCREEN: i32 = 77;
+        const SM_CXVIRTUALSCREEN: i32 = 78;
+        const SM_CYVIRTUALSCREEN: i32 = 79;
+        unsafe {
+            let x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let w = GetSystemMetrics(SM_CXVIRTUALSCREEN).max(8);
+            let h = GetSystemMetrics(SM_CYVIRTUALSCREEN).max(8);
+            [x, y, w, h]
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        [0, 0, screen_dimensions().0 as i32, screen_dimensions().1 as i32]
+    }
+}
+
+/// Enumerates all attached monitors with their virtual-desktop rects.
+pub fn enum_monitors() -> Vec<MonitorInfo> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut list: Vec<MonitorInfo> = Vec::new();
+        unsafe {
+            EnumDisplayMonitors(
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                Some(monitor_enum_proc),
+                &mut list as *mut Vec<MonitorInfo> as isize,
+            );
+        }
+        list
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let (w, h) = screen_dimensions();
+        vec![MonitorInfo { index: 0, primary: true, rect: [0, 0, w as i32, h as i32], name: "Primary".into() }]
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct RectL {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct MonitorInfoExW {
+    cb_size: u32,
+    rc_monitor: RectL,
+    rc_work: RectL,
+    dw_flags: u32,
+    sz_device: [u16; 32],
+}
+
+#[cfg(target_os = "windows")]
+const MONITORINFOF_PRIMARY: u32 = 1;
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn monitor_enum_proc(
+    h_monitor: *mut core::ffi::c_void,
+    _hdc: *mut core::ffi::c_void,
+    _lprc: *mut RectL,
+    l_param: isize,
+) -> i32 {
+    let list = &mut *(l_param as *mut Vec<MonitorInfo>);
+    let mut mi = MonitorInfoExW {
+        cb_size: std::mem::size_of::<MonitorInfoExW>() as u32,
+        ..Default::default()
+    };
+    if GetMonitorInfoW(h_monitor, &mut mi) != 0 {
+        let r = mi.rc_monitor;
+        let name = if mi.sz_device[0] != 0 {
+            let end = mi.sz_device.iter().position(|&c| c == 0).unwrap_or(32);
+            String::from_utf16_lossy(&mi.sz_device[..end])
+        } else {
+            format!("Monitor {}", list.len())
+        };
+        list.push(MonitorInfo {
+            index: list.len(),
+            primary: mi.dw_flags & MONITORINFOF_PRIMARY != 0,
+            rect: [r.left, r.top, r.right - r.left, r.bottom - r.top],
+            name,
+        });
+    }
+    1 // continue enumeration
+}
+
+/// Returns `true` when (nearly) every sampled pixel of the frame is black —
+/// used to detect a blank/frozen DXGI capture and fall back to GDI.
+pub fn frame_is_black(img: &RgbaImage) -> bool {
+    let (w, h) = img.dimensions();
+    if w < 8 || h < 8 {
+        return true;
+    }
+    let step_x = (w / 16).max(4) as usize;
+    let step_y = (h / 16).max(4) as usize;
+    let raw = img.as_raw();
+    let mut dark = 0u32;
+    let mut total = 0u32;
+    for y in (0..h as usize).step_by(step_y) {
+        let base = y * w as usize * 4;
+        for x in (0..w as usize).step_by(step_x) {
+            let p = base + x * 4;
+            let (r, g, b) = (raw[p], raw[p + 1], raw[p + 2]);
+            total += 1;
+            if (r as u32 + g as u32 + b as u32) < 45 {
+                dark += 1;
+            }
+        }
+    }
+    total > 0 && dark * 100 >= total * 96
+}
+// ============================================================================
+// Real mouse cursor capture (GetCursorInfo + DrawIconEx) and highlight styles
+// ============================================================================
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct WinPoint {
+    x: i32,
+    y: i32,
+}
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CursorInfo {
+    cb_size: u32,
+    flags: u32,
+    h_cursor: *mut core::ffi::c_void,
+    pt_screen_pos: WinPoint,
+}
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct IconInfo {
+    f_icon: i32,
+    x_hotspot: u32,
+    y_hotspot: u32,
+    hbm_mask: *mut core::ffi::c_void,
+    hbm_color: *mut core::ffi::c_void,
+}
+
+const CURSOR_SHOWING: u32 = 0x0000_0001;
+const DI_NORMAL: u32 = 0x0003;
+const VK_LBUTTON: i32 = 0x01;
+const SM_CXCURSOR: i32 = 13;
+const SM_CYCURSOR: i32 = 14;
+
+#[cfg(target_os = "windows")]
+#[link(name = "user32")]
+extern "system" {
+    fn GetCursorInfo(pci: *mut CursorInfo) -> i32;
+    fn GetCursorPos(pt: *mut WinPoint) -> i32;
+    fn GetIconInfo(h_icon: *mut core::ffi::c_void, piconinfo: *mut IconInfo) -> i32;
+    fn DrawIconEx(
+        hdc: *mut core::ffi::c_void,
+        x: i32,
+        y: i32,
+        h_icon: *mut core::ffi::c_void,
+        cx: i32,
+        cy: i32,
+        istep_if_ani_cur: u32,
+        hbr_flicker_free: *mut core::ffi::c_void,
+        di_flags: u32,
+    ) -> i32;
+    fn GetAsyncKeyState(v_key: i32) -> i16;
+    fn EnumDisplayMonitors(
+        hdc: *mut core::ffi::c_void,
+        lprc_clip: *mut core::ffi::c_void,
+        lpfn_enum: Option<unsafe extern "system" fn(*mut core::ffi::c_void, *mut core::ffi::c_void, *mut RectL, isize) -> i32>,
+        l_param: isize,
+    ) -> i32;
+    fn GetMonitorInfoW(h_monitor: *mut core::ffi::c_void, lpmi: *mut MonitorInfoExW) -> i32;
+}
+
+/// Current absolute (virtual desktop) cursor position; `None` when hidden/unavailable.
+pub fn cursor_position() -> Option<(i32, i32)> {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        let mut info = CursorInfo {
+            cb_size: std::mem::size_of::<CursorInfo>() as u32,
+            ..Default::default()
+        };
+        if GetCursorInfo(&mut info) != 0 && info.flags & CURSOR_SHOWING != 0 && !info.h_cursor.is_null() {
+            return Some((info.pt_screen_pos.x, info.pt_screen_pos.y));
+        }
+        None
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
+
+/// `true` while the primary mouse button is physically down.
+pub fn mouse_left_down() -> bool {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        (GetAsyncKeyState(VK_LBUTTON) as i16) < 0
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
+/// Rasterized real cursor image with hotspot (image top-left = (0,0), the
+/// hotspot maps to the cursor position in the virtual desktop).
+#[derive(Clone)]
+pub struct CursorSprite {
+    pub width: u32,
+    pub height: u32,
+    pub hot_x: i32,
+    pub hot_y: i32,
+    pub rgba: Vec<u8>,
+}
+
+/// Captures the real system mouse cursor as an RGBA sprite (BGRA -> RGBA,
+/// trimmed to its visible bounding box). Returns `None` when hidden.
+pub fn capture_cursor_sprite() -> Option<CursorSprite> {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        let mut info = CursorInfo {
+            cb_size: std::mem::size_of::<CursorInfo>() as u32,
+            ..Default::default()
+        };
+        if GetCursorInfo(&mut info) != 0
+            && info.flags & CURSOR_SHOWING != 0
+            && !info.h_cursor.is_null()
+        {
+            let mut ii = IconInfo::default();
+            if GetIconInfo(info.h_cursor, &mut ii) != 0 {
+                let hot_x = ii.x_hotspot as i32;
+                let hot_y = ii.y_hotspot as i32;
+                if !ii.hbm_mask.is_null() {
+                    DeleteObject(ii.hbm_mask);
+                }
+                if !ii.hbm_color.is_null() {
+                    DeleteObject(ii.hbm_color);
+                }
+                let (w, h) = (
+                    GetSystemMetrics(SM_CXCURSOR).max(16) as u32,
+                    GetSystemMetrics(SM_CYCURSOR).max(16) as u32,
+                );
+                if let Some(sprite) = rasterize_cursor(info.h_cursor, w, h, hot_x, hot_y) {
+                    return Some(sprite);
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn rasterize_cursor(h_cursor: *mut core::ffi::c_void, w: u32, h: u32, hot_x: i32, hot_y: i32) -> Option<CursorSprite> {
+    unsafe {
+        let hdc_screen = GetDC(std::ptr::null_mut());
+        let hdc_mem = CreateCompatibleDC(hdc_screen);
+        if hdc_mem.is_null() {
+            ReleaseDC(std::ptr::null_mut(), hdc_screen);
+            return None;
+        }
+        let hbm = CreateCompatibleBitmap(hdc_screen, w as i32, h as i32);
+        if hbm.is_null() {
+            DeleteDC(hdc_mem);
+            ReleaseDC(std::ptr::null_mut(), hdc_screen);
+            return None;
+        }
+        let old = SelectObject(hdc_mem, hbm);
+        // DrawIconEx renders with the image top-left at (0,0); the reported
+        // hotspot is then the arrow-tip position inside the raster.
+        DrawIconEx(hdc_mem, 0, 0, h_cursor, w as i32, h as i32, 0, std::ptr::null_mut(), DI_NORMAL);
+
+        let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
+        let mut bmi = BitmapInfo {
+            bmi_header: BitmapInfoHeader {
+                bi_size: std::mem::size_of::<BitmapInfoHeader>() as u32,
+                bi_width: w as i32,
+                bi_height: -(h as i32),
+                bi_planes: 1,
+                bi_bit_count: 32,
+                bi_compression: BI_RGB,
+                bi_size_image: 0,
+                bi_x_pels_per_meter: 0,
+                bi_y_pels_per_meter: 0,
+                bi_clr_used: 0,
+                bi_clr_important: 0,
+            },
+            bmi_colors: [0],
+        };
+        let lines = GetDIBits(hdc_mem, hbm, 0, h, buf.as_mut_ptr(), &mut bmi, DIB_RGB_COLORS);
+        SelectObject(hdc_mem, old);
+        DeleteObject(hbm);
+        DeleteDC(hdc_mem);
+        ReleaseDC(std::ptr::null_mut(), hdc_screen);
+        if lines == 0 {
+            return None;
+        }
+
+        // BGRA -> RGBA
+        for px in buf.chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
+        // Trim to the non-transparent bounding box (keeps the hotspot offset)
+        let mut min_x = w as i32;
+        let mut min_y = h as i32;
+        let mut max_x = -1i32;
+        let mut max_y = -1i32;
+        for y in 0..h {
+            for x in 0..w {
+                if buf[((y * w + x) * 4 + 3) as usize] != 0 {
+                    min_x = min_x.min(x as i32);
+                    min_y = min_y.min(y as i32);
+                    max_x = max_x.max(x as i32);
+                    max_y = max_y.max(y as i32);
+                }
+            }
+        }
+        if max_x < min_x || max_y < min_y {
+            return None;
+        }
+        let cw = (max_x - min_x + 1) as u32;
+        let ch = (max_y - min_y + 1) as u32;
+        let mut rgba = Vec::with_capacity((cw * ch * 4) as usize);
+        for y in min_y..=max_y {
+            let row = (y as u32) * w * 4;
+            for x in min_x..=max_x {
+                let p = (row + (x as u32) * 4) as usize;
+                rgba.extend_from_slice(&[buf[p], buf[p + 1], buf[p + 2], buf[p + 3]]);
+            }
+        }
+        Some(CursorSprite {
+            width: cw,
+            height: ch,
+            hot_x: hot_x - min_x,
+            hot_y: hot_y - min_y,
+            rgba,
+        })
+    }
+}
+
+/// Blits a captured cursor sprite onto the frame at its virtual-desktop position.
+pub fn blit_cursor(frame: &mut RgbaImage, origin: (i32, i32), sprite: &CursorSprite, pos: (i32, i32)) {
+    let (fw, fh) = (frame.width() as i32, frame.height() as i32);
+    let dx = pos.0 - origin.0 - sprite.hot_x;
+    let dy = pos.1 - origin.1 - sprite.hot_y;
+    let cw = sprite.width as i32;
+    let ch = sprite.height as i32;
+    if dx >= fw || dy >= fh || dx + cw <= 0 || dy + ch <= 0 {
+        return;
+    }
+    let begin_x = dx.max(0);
+    let begin_y = dy.max(0);
+    let end_x = (dx + cw).min(fw);
+    let end_y = (dy + ch).min(fh);
+    for y in begin_y..end_y {
+        for x in begin_x..end_x {
+            let sx = (x - dx) as usize;
+            let sy = (y - dy) as usize;
+            let sp = (sy * sprite.width as usize + sx) * 4;
+            let a = sprite.rgba[sp + 3] as u32;
+            if a == 0 {
+                continue;
+            }
+            let dst = frame.get_pixel_mut(x as u32, y as u32);
+            if a >= 250 {
+                dst[0] = sprite.rgba[sp];
+                dst[1] = sprite.rgba[sp + 1];
+                dst[2] = sprite.rgba[sp + 2];
+                dst[3] = 255;
+            } else {
+                let inv = 255 - a;
+                dst[0] = ((sprite.rgba[sp] as u32 * a + dst[0] as u32 * inv) / 255) as u8;
+                dst[1] = ((sprite.rgba[sp + 1] as u32 * a + dst[1] as u32 * inv) / 255) as u8;
+                dst[2] = ((sprite.rgba[sp + 2] as u32 * a + dst[2] as u32 * inv) / 255) as u8;
+            }
+        }
+    }
+}
+
+/// Expanding click-ripple state (position in virtual desktop coords).
+#[derive(Clone, Copy)]
+pub struct ClickRipple {
+    pub x: i32,
+    pub y: i32,
+    /// 0.0 just pressed … 1.0 faded out.
+    pub phase: f32,
+}
+
+const RIPPLE_RADIUS_MAX: f32 = 130.0;
+const HALO_RADIUS: f32 = 34.0;
+const SPOTLIGHT_RADIUS: f32 = 190.0;
+
+/// Applies a cursor highlight style (plus an optional click ripple) to the frame.
+pub fn apply_cursor_overlay(
+    frame: &mut RgbaImage,
+    origin: (i32, i32),
+    pos: (i32, i32),
+    style: CursorStyle,
+    ripple: Option<ClickRipple>,
+) {
+    let (w, h) = frame.dimensions();
+    if w == 0 || h == 0 {
+        return;
+    }
+    let cx = (pos.0 - origin.0) as f32;
+    let cy = (pos.1 - origin.1) as f32;
+    let scale = (w.min(h) as f32 / 720.0).clamp(0.6, 2.2);
+
+    match style {
+        CursorStyle::Spotlight => {
+            let r = SPOTLIGHT_RADIUS * scale;
+            let dim = 0.45f32;
+            let y0 = (cy - r).floor().max(0.0) as u32;
+            let y1 = (cy + r).ceil().min(h as f32) as u32;
+            let x0 = (cx - r).floor().max(0.0) as u32;
+            let x1 = (cx + r).ceil().min(w as f32) as u32;
+            for y in 0..y0 {
+                dim_row(frame, y, dim);
+            }
+            for y in y1..h {
+                dim_row(frame, y, dim);
+            }
+            for y in y0..y1 {
+                for x in 0..x0 {
+                    dim_px(frame, x, y, dim);
+                }
+                for x in x1..w {
+                    dim_px(frame, x, y, dim);
+                }
+            }
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let dxp = x as f32 + 0.5 - cx;
+                    let dyp = y as f32 + 0.5 - cy;
+                    if dxp * dxp + dyp * dyp > r * r {
+                        dim_px(frame, x, y, dim);
+                    }
+                }
+            }
+        }
+        CursorStyle::Halo => {
+            let r = HALO_RADIUS * scale;
+            draw_ring(frame, cx, cy, r, 3.5 * scale, 255, 59, 107, 220);
+            draw_filled_circle(frame, cx, cy, 2.5 * scale, 255, 59, 107, 255);
+        }
+        CursorStyle::ClickRipple => {}
+        CursorStyle::ColoredArrow => {}
+    }
+
+    if let Some(rip) = ripple {
+        let r = 14.0 + RIPPLE_RADIUS_MAX * rip.phase;
+        let alpha = ((1.0 - rip.phase) * 255.0).clamp(0.0, 255.0) as u8;
+        let lx = rip.x as f32 - origin.0 as f32;
+        let ly = rip.y as f32 - origin.1 as f32;
+        draw_ring(frame, lx, ly, r, 5.0, 66, 165, 245, alpha);
+        if rip.phase < 0.45 {
+            draw_ring(frame, lx, ly, r * 0.55, 3.5, 255, 59, 107, alpha);
+        }
+    }
+
+    if style == CursorStyle::ColoredArrow {
+        draw_colored_arrow(frame, pos.0 - origin.0, pos.1 - origin.1);
+    }
+}
+
+fn dim_row(frame: &mut RgbaImage, y: u32, dim: f32) {
+    let (w, _) = frame.dimensions();
+    let w = w as usize;
+    let row = frame.as_mut();
+    let base = ((y as usize) * w * 4) as usize;
+    for i in 0..(w as usize * 4) {
+        if i % 4 != 3 && row[base + i] != 0 {
+            row[base + i] = (row[base + i] as f32 * dim) as u8;
+        }
+    }
+}
+
+fn dim_px(frame: &mut RgbaImage, x: u32, y: u32, dim: f32) {
+    let px = frame.get_pixel_mut(x, y);
+    for c in 0..3 {
+        px[c] = (px[c] as f32 * dim) as u8;
+    }
+}
+
+fn draw_filled_circle(frame: &mut RgbaImage, cx: f32, cy: f32, r: f32, r8: u8, g8: u8, b8: u8, a8: u8) {
+    let (w, h) = frame.dimensions();
+    let y0 = (cy - r).floor().max(0.0) as u32;
+    let y1 = (cy + r).ceil().min(h as f32) as u32;
+    let x0 = (cx - r).floor().max(0.0) as u32;
+    let x1 = (cx + r).ceil().min(w as f32) as u32;
+    let r2 = r * r;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let dxp = x as f32 + 0.5 - cx;
+            let dyp = y as f32 + 0.5 - cy;
+            if dxp * dxp + dyp * dyp <= r2 {
+                let px = frame.get_pixel_mut(x, y);
+                px[0] = blend(px[0], r8, a8);
+                px[1] = blend(px[1], g8, a8);
+                px[2] = blend(px[2], b8, a8);
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_ring(
+    frame: &mut RgbaImage,
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    width: f32,
+    r8: u8,
+    g8: u8,
+    b8: u8,
+    a8: u8,
+) {
+    let (w, h) = frame.dimensions();
+    let outer = radius + width / 2.0;
+    let inner_max = (radius - width / 2.0).max(0.0);
+    let y0 = (cy - outer).floor().max(0.0) as u32;
+    let y1 = (cy + outer).ceil().min(h as f32) as u32;
+    let x0 = (cx - outer).floor().max(0.0) as u32;
+    let x1 = (cx + outer).ceil().min(w as f32) as u32;
+    let o2 = outer * outer;
+    let i2 = inner_max * inner_max;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let dxp = x as f32 + 0.5 - cx;
+            let dyp = y as f32 + 0.5 - cy;
+            let d2 = dxp * dxp + dyp * dyp;
+            if d2 <= o2 && d2 >= i2 {
+                let px = frame.get_pixel_mut(x, y);
+                px[0] = blend(px[0], r8, a8);
+                px[1] = blend(px[1], g8, a8);
+                px[2] = blend(px[2], b8, a8);
+            }
+        }
+    }
+}
+
+fn blend(dst: u8, src: u8, a: u8) -> u8 {
+    if a >= 250 {
+        return src;
+    }
+    ((src as u32 * a as u32 + dst as u32 * (255 - a as u32)) / 255) as u8
+}
+
+/// Bold colored arrow replacing the real cursor (0,0 = hotspot/tip).
+const ARROW_MASK: [&str; 16] = [
+    "X................",
+    "XX...............",
+    "X.X..............",
+    "X..X.............",
+    "X...X............",
+    "X....X...........",
+    "X.....X..........",
+    "X......X.........",
+    "X.......X........",
+    "X........X.......",
+    "X.........X......",
+    "X..........X.....",
+    "X...........X....",
+    "X............X...",
+    "X.............X..",
+    "X..............X.",
+];
+
+fn draw_colored_arrow(frame: &mut RgbaImage, hx: i32, hy: i32) {
+    let size = 16u32;
+    let ox = hx;
+    let oy = hy - 2;
+    for y in 0..size {
+        for x in 0..size {
+            let row = ARROW_MASK[y as usize].as_bytes();
+            let fill = row[x as usize] == b'X';
+            let outline = !fill
+                && [(x.wrapping_sub(1), y), (x + 1, y), (x, y.wrapping_sub(1)), (x, y + 1)]
+                    .iter()
+                    .any(|&(nx, ny)| {
+                        nx < size
+                            && ny < size
+                            && ARROW_MASK[ny as usize].as_bytes()[nx as usize] == b'X'
+                    });
+            if !fill && !outline {
+                continue;
+            }
+            let px = ox + x as i32;
+            let py = oy + y as i32;
+            if px < 0 || py < 0 || px >= frame.width() as i32 || py >= frame.height() as i32 {
+                continue;
+            }
+            let (r8, g8, b8) = if fill { (255, 180, 60) } else { (20, 20, 20) };
+            let dst = frame.get_pixel_mut(px as u32, py as u32);
+            if fill {
+                dst[0] = r8;
+                dst[1] = g8;
+                dst[2] = b8;
+            } else {
+                dst[0] = blend(dst[0], r8, 220);
+                dst[1] = blend(dst[1], g8, 220);
+                dst[2] = blend(dst[2], b8, 220);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// DXGI Desktop Duplication capture (hardware desktop: games, GPU-accelerated
+// browsers, layered windows — no black screen) with automatic GDI fallback.
+// ============================================================================
+
+#[cfg(target_os = "windows")]
+pub struct DxgiCapturer {
+    device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    ctx: windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+    dup: windows::Win32::Graphics::Dxgi::IDXGIOutputDuplication,
+    out_rect: [i32; 4],
+    format: DXGI_FORMAT,
+    staging: Option<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D>,
+    lost: bool,
+    last_err: Option<String>,
+}
+
+#[cfg(not(target_os = "windows"))]
+pub struct DxgiCapturer;
+
+#[cfg(target_os = "windows")]
+impl DxgiCapturer {
+    pub fn new(monitor_index: usize) -> Result<Self, String> {
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D::{
+            D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_11_0,
+            D3D_FEATURE_LEVEL_9_1,
+        };
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11CreateDevice, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CPU_ACCESS_READ,
+            D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, ID3D11Device,
+            ID3D11DeviceContext, ID3D11Texture2D,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory1, IDXGIAdapter, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput,
+            IDXGIOutput1, IDXGIOutputDuplication,
+        };
+
+        unsafe {
+            let factory: IDXGIFactory1 = CreateDXGIFactory1()
+                .map_err(|e| format!("CreateDXGIFactory1 failed: {e}"))?;
+
+            // Walk adapters/outputs until the requested global output index.
+            let mut global_output = 0usize;
+            let mut adapter1: Option<IDXGIAdapter1> = None;
+            let mut output: Option<IDXGIOutput> = None;
+            let mut out_desc = None;
+            let mut adapter_idx = 0u32;
+            while let Ok(a) = factory.EnumAdapters1(adapter_idx) {
+                let mut out_idx = 0u32;
+                while let Ok(o) = a.EnumOutputs(out_idx) {
+                    if global_output == monitor_index {
+                        adapter1 = Some(a.clone());
+                        let desc = o.GetDesc().map_err(|e| format!("GetDesc: {e}"))?;
+                        out_desc = Some(desc);
+                        output = Some(o);
+                        break;
+                    }
+                    global_output += 1;
+                    out_idx += 1;
+                }
+                if output.is_some() {
+                    break;
+                }
+                adapter_idx += 1;
+            }
+            let adapter1 = adapter1.ok_or_else(|| format!("No monitor with index {monitor_index}"))?;
+            let output = output.ok_or_else(|| format!("No output for monitor {monitor_index}"))?;
+            let out_desc = out_desc.ok_or_else(|| "monitor desc missing".to_string())?;
+
+            let adapter: IDXGIAdapter = adapter1.cast().map_err(|e| format!("adapter cast: {e}"))?;
+            let output1: IDXGIOutput1 = output.cast().map_err(|e| format!("output cast: {e}"))?;
+
+            let levels = [
+                D3D_FEATURE_LEVEL_11_0,
+                D3D_FEATURE_LEVEL_10_0,
+                D3D_FEATURE_LEVEL_9_1,
+            ];
+            let mut device: Option<ID3D11Device> = None;
+            let mut ctx: Option<ID3D11DeviceContext> = None;
+            D3D11CreateDevice(
+                Some(&adapter),
+                D3D_DRIVER_TYPE_HARDWARE,
+                Default::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&levels),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut ctx),
+            )
+            .map_err(|e| format!("D3D11CreateDevice failed: {e}"))?;
+            let device = device.ok_or_else(|| "no d3d device".to_string())?;
+            let ctx = ctx.ok_or_else(|| "no d3d context".to_string())?;
+
+            let dup: IDXGIOutputDuplication = output1
+                .DuplicateOutput(&device)
+                .map_err(|e| format!("DuplicateOutput failed (secure desktop or driver): {e}"))?;
+
+            let dup_desc = dup.GetDesc();
+            let format = dup_desc.ModeDesc.Format;
+
+            let r = out_desc.DesktopCoordinates;
+            let w = (r.right - r.left).max(2) as u32;
+            let h = (r.bottom - r.top).max(2) as u32;
+
+            let tex_desc = D3D11_TEXTURE2D_DESC {
+                Width: w,
+                Height: h,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                MiscFlags: 0,
+            };
+            let mut staging: Option<ID3D11Texture2D> = None;
+            device
+                .CreateTexture2D(&tex_desc, None, Some(&mut staging))
+                .map_err(|e| format!("CreateTexture2D staging failed: {e}"))?;
+
+            Ok(Self {
+                device,
+                ctx,
+                dup,
+                out_rect: [r.left, r.top, w as i32, h as i32],
+                format,
+                staging,
+                lost: false,
+                last_err: None,
+            })
+        }
+    }
+
+    /// Bounding box (virtual desktop coords) of the duplicated monitor.
+    pub fn rect(&self) -> [i32; 4] {
+        self.out_rect
+    }
+
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_err.as_deref()
+    }
+
+    /// Captures `region` (virtual desktop coords [x, y, w, h]) — clipped to the
+    /// duplicated monitor — as an RGBA frame. `None` = no new desktop frame yet.
+    pub fn capture_region(&mut self, region: [i32; 4]) -> Option<RgbaImage> {
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D11::{D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, ID3D11Texture2D};
+        use windows::Win32::Graphics::Dxgi::{
+            DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, IDXGIResource,
+        };
+
+        if self.lost {
+            if let Err(e) = self.recreate() {
+                self.last_err = Some(e);
+                return None;
+            }
+        }
+
+        unsafe {
+            let mut frame_info: DXGI_OUTDUPL_FRAME_INFO = Default::default();
+            let mut resource: Option<IDXGIResource> = None;
+            if let Err(e) = self
+                .dup
+                .AcquireNextFrame(0, &mut frame_info, &mut resource)
+            {
+                if e.code() == DXGI_ERROR_WAIT_TIMEOUT {
+                    return None;
+                }
+                if e.code() == DXGI_ERROR_ACCESS_LOST {
+                    self.lost = true;
+                    return None;
+                }
+                self.last_err = Some(format!("AcquireNextFrame: {e}"));
+                return None;
+            }
+            let Some(res) = resource else {
+                let _ = self.dup.ReleaseFrame();
+                return None;
+            };
+            let tex: ID3D11Texture2D = match res.cast() {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = self.dup.ReleaseFrame();
+                    self.last_err = Some(format!("resource cast: {e}"));
+                    return None;
+                }
+            };
+            let staging = self.staging.clone();
+            if let Some(st) = &staging {
+                self.ctx.CopyResource(st, &tex);
+            }
+            let _ = self.dup.ReleaseFrame();
+
+            let st = staging?;
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            if let Err(e) = self.ctx.Map(&st, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) {
+                self.last_err = Some(format!("Map staging: {e}"));
+                return None;
+            }
+            let img = read_mapped_rgba(&mapped, self.out_rect, self.format, region);
+            self.ctx.Unmap(&st, 0);
+            if img.is_none() {
+                self.last_err = Some("staging row read failed".to_string());
+            }
+            img
+        }
+    }
+
+    /// Re-creates the duplication object (after DXGI_ERROR_ACCESS_LOST).
+    pub fn recreate(&mut self) -> Result<(), String> {
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Dxgi::{IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication};
+
+        let output: IDXGIOutput = unsafe { self.dup.GetParent() }.map_err(|e| format!("GetParent: {e}"))?;
+        let output1: IDXGIOutput1 = output.cast().map_err(|e| format!("output cast: {e}"))?;
+        let dup: IDXGIOutputDuplication = unsafe { output1.DuplicateOutput(&self.device) }
+            .map_err(|e| format!("re-DuplicateOutput: {e}"))?;
+        self.dup = dup;
+        self.lost = false;
+        self.last_err = None;
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl DxgiCapturer {
+    pub fn new(_monitor_index: usize) -> Result<Self, String> {
+        Err("DXGI not supported on this platform".into())
+    }
+    pub fn rect(&self) -> [i32; 4] {
+        [0, 0, 0, 0]
+    }
+    pub fn last_error(&self) -> Option<&str> {
+        None
+    }
+    pub fn capture_region(&mut self, _region: [i32; 4]) -> Option<RgbaImage> {
+        None
+    }
+    pub fn recreate(&mut self) -> Result<(), String> {
+        Err("DXGI not supported on this platform".into())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn read_mapped_rgba(
+    mapped: &D3D11_MAPPED_SUBRESOURCE,
+    out_rect: [i32; 4],
+    format: DXGI_FORMAT,
+    region: [i32; 4],
+) -> Option<RgbaImage> {
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM};
+    let [ox, oy, ow, oh] = out_rect;
+    let [rx, ry, rw, rh] = region;
+    let x0 = rx.max(ox);
+    let y0 = ry.max(oy);
+    let x1 = (rx + rw).min(ox + ow);
+    let y1 = (ry + rh).min(oy + oh);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let cw = (x1 - x0) as u32;
+    let ch = (y1 - y0) as u32;
+    let pitch = mapped.RowPitch as usize;
+    let src_x = (x0 - ox) as usize;
+    let src_y = (y0 - oy) as usize;
+    let base = unsafe { mapped.pData as *const u8 };
+    let mut rgba = vec![0u8; cw as usize * ch as usize * 4];
+
+    match format {
+        DXGI_FORMAT_R10G10B10A2_UNORM => {
+            for y in 0..ch as usize {
+                let row = unsafe { base.add((src_y + y) * pitch) };
+                for x in 0..cw as usize {
+                    let v = u32::from_le_bytes(unsafe {
+                        std::ptr::read_unaligned(row.add((src_x + x) * 4) as *const [u8; 4])
+                    });
+                    let r = ((v >> 22) & 0x3FF) as u8;
+                    let g = ((v >> 12) & 0x3FF) as u8;
+                    let b = ((v >> 2) & 0x3FF) as u8;
+                    let p = (y * cw as usize + x) * 4;
+                    rgba[p] = r;
+                    rgba[p + 1] = g;
+                    rgba[p + 2] = b;
+                    rgba[p + 3] = 255;
+                }
+            }
+        }
+        _ => {
+            // B8G8R8A8 (or equivalent 4-byte layout)
+            let _ = DXGI_FORMAT_B8G8R8A8_UNORM;
+            for y in 0..ch as usize {
+                let row = unsafe { base.add((src_y + y) * pitch) };
+                let out_start = y * cw as usize * 4;
+                for x in 0..cw as usize {
+                    let p = (src_x + x) * 4;
+                    let b = unsafe { *row.add(p) };
+                    let g = unsafe { *row.add(p + 1) };
+                    let r = unsafe { *row.add(p + 2) };
+                    let a = unsafe { *row.add(p + 3) };
+                    let o = out_start + x * 4;
+                    rgba[o] = r;
+                    rgba[o + 1] = g;
+                    rgba[o + 2] = b;
+                    rgba[o + 3] = if a == 0 { 255 } else { a };
+                }
+            }
+        }
+    }
+    RgbaImage::from_raw(cw, ch, rgba)
+}
+
+/// Convenience: try DXGI first, fall back to GDI when it yields nothing.
+pub fn capture_region_smart(
+    dxgi: Option<&mut DxgiCapturer>,
+    region: [u32; 4],
+    prefer_dxgi: bool,
+) -> RgbaImage {
+    let region_i = [region[0] as i32, region[1] as i32, region[2] as i32, region[3] as i32];
+    if prefer_dxgi {
+        if let Some(cap) = dxgi {
+            if let Some(img) = cap.capture_region(region_i) {
+                return img;
+            }
+        }
+    }
+    capture_screen_region(region[0] as i32, region[1] as i32, region[2], region[3])
+}
+
