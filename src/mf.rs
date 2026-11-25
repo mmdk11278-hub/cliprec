@@ -234,6 +234,8 @@ impl Mp4Writer {
                 aout.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, ch).map_err(hres)?;
                 aout.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, rate).map_err(hres)?;
                 aout.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16).map_err(hres)?;
+                aout.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 20_000)
+                    .map_err(hres)?;
                 let aidx = writer.AddStream(&aout).map_err(hres)?;
 
                 let ain = MFCreateMediaType().map_err(hres)?;

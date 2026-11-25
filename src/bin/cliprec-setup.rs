@@ -120,7 +120,7 @@ fn perform_install(
             "$reg = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\ClipRec'; \
              New-Item -Path $reg -Force | Out-Null; \
              Set-ItemProperty -Path $reg -Name 'DisplayName' -Value 'ClipRec — Screen Capture & Recording Studio'; \
-             Set-ItemProperty -Path $reg -Name 'DisplayVersion' -Value '0.4.0'; \
+             Set-ItemProperty -Path $reg -Name 'DisplayVersion' -Value '0.4.1'; \
              Set-ItemProperty -Path $reg -Name 'Publisher' -Value 'ClipRec Studio'; \
              Set-ItemProperty -Path $reg -Name 'DisplayIcon' -Value '{ico_s}'; \
              Set-ItemProperty -Path $reg -Name 'InstallLocation' -Value '{dir_s}'; \
@@ -195,7 +195,7 @@ impl eframe::App for SetupApp {
                                 .color(Color32::WHITE),
                         );
                         ui.label(
-                            RichText::new("v0.4.0 • Screen Recorder, MP4 Studio & Annotator")
+                            RichText::new("v0.4.1 • Screen Recorder, MP4 Studio & Annotator")
                                 .size(12.0)
                                 .color(Color32::from_rgb(0xE9, 0xD5, 0xFF)),
                         );
@@ -303,7 +303,7 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("ClipRec Setup v0.4.0")
+            .with_title("ClipRec Setup v0.4.1")
             .with_icon(Arc::new(icon::app_icon_data()))
             .with_inner_size([520.0, 370.0])
             .with_resizable(false),

@@ -1012,7 +1012,12 @@ fn mix_audio(
     for i in 0..n {
         let a = mic_f.get(i).copied().unwrap_or(0.0);
         let b = sys_f.get(i).copied().unwrap_or(0.0);
-        let s = (a + b).clamp(-1.0, 1.0);
+        let sum = a + b;
+        let s = if sum.abs() <= 0.85 {
+            sum
+        } else {
+            sum.signum() * (0.85 + 0.15 * ((sum.abs() - 0.85) / 0.15).tanh())
+        };
         out.push((s * i16::MAX as f32) as i16);
     }
     out
